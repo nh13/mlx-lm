@@ -1017,9 +1017,25 @@ class V4Attention(nn.Module):
             v = mx.concatenate([compressed_v, v], axis=2)
             n_comp = compressed_k.shape[2]
             if mask is not None:
-                comp_shape = list(mask.shape)
-                comp_shape[-1] = n_comp
-                comp_mask = mx.zeros(comp_shape, dtype=mask.dtype)
+                # Compressed pool columns must be ATTENDED (bool True) and CAUSAL:
+                # row j summarizes prefill positions [j*r, (j+1)*r), so a query at
+                # position i attends it only once (j+1)*r-1 <= i. The prior
+                # mx.zeros(dtype=bool) masked the whole pool out (garbage once
+                # S > sliding_window). Decode (S==1) has mask=None and is skipped.
+                # (from machiabeli/mlx-lm-1 PR #6, local-only)
+                S_q = mask.shape[-2]
+                r = self.compress_ratio
+                comp_end = mx.arange(n_comp) * r + (r - 1)
+                comp_mask = mx.arange(S_q)[:, None] >= comp_end[None, :]
+                comp_mask = mx.broadcast_to(
+                    comp_mask, list(mask.shape[:-2]) + [S_q, n_comp]
+                ).astype(mask.dtype)
+                if mask.dtype != mx.bool_:
+                    comp_mask = mx.where(
+                        comp_mask.astype(mx.bool_),
+                        mx.array(0.0, mask.dtype),
+                        mx.array(float("-inf"), mask.dtype),
+                    )
                 mask = mx.concatenate([comp_mask, mask], axis=-1)
 
         out = scaled_dot_product_attention(
