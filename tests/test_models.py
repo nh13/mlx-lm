@@ -1705,6 +1705,43 @@ class TestModels(unittest.TestCase):
         mx.eval(outputs)
         self.assertEqual(outputs.shape, (1, 1, args.vocab_size))
 
+    def test_deepseek_v4_compressed_cache_matches_prefill(self):
+        # Regression: the incremental-decode compressed-KV cache must reproduce
+        # the prefill Compressor output bit-for-bit, including the prefill
+        # remainder tokens (S % ratio) and the ratio-4 cross-window overlap.
+        # Guards against the decode/chunk divergence that dropped tokens.
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            head_dim=32,
+            qk_rope_head_dim=16,
+            rms_norm_eps=1e-6,
+        )
+
+        def check(ratio, S, chunks):
+            comp = deepseek_v4.Compressor(args, ratio, head_dim=32)
+            x = mx.random.normal((1, S, 64))
+            ref = comp(x)
+            c1 = deepseek_v4.CompressedKVCache()
+            for i in range(S):
+                c1.accumulate(x[:, i : i + 1], comp)
+            c2 = deepseek_v4.CompressedKVCache()
+            j = 0
+            for cs in chunks:
+                c2.accumulate(x[:, j : j + cs], comp)
+                j += cs
+            for pool in (c1._pool, c2._pool):
+                self.assertEqual(pool.shape, ref.shape)
+                self.assertTrue(mx.allclose(pool, ref, atol=1e-5, rtol=1e-5))
+
+        check(4, 14, [5, 9])
+        check(4, 16, [3, 3, 10])
+        check(2, 15, [7, 8])
+
     def test_deepseek_v4_sanitize_unpacks_fp4_experts(self):
         from mlx_lm.models import deepseek_v4
 
