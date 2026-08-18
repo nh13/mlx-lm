@@ -39,10 +39,6 @@ def mixed_quant_predicate_builder(
     if len(down_keys) == 0:
         raise ValueError("Model does not have expected keys for mixed quant.")
 
-    # Look for the layer index location in the path:
-    for layer_location, k in enumerate(down_keys[0].split(".")):
-        if k.isdigit():
-            break
     num_layers = len(model.layers)
 
     def mixed_quant_predicate(
@@ -53,11 +49,11 @@ def mixed_quant_predicate_builder(
         Ref: https://github.com/ggerganov/llama.cpp/blob/917786f43d0f29b7c77a0c56767c0fa4df68b1c5/src/llama.cpp#L5265
         By Alex Barron: https://gist.github.com/barronalex/84addb8078be21969f1690c1454855f3
         """
-        index = (
-            int(path.split(".")[layer_location])
-            if len(path.split(".")) > layer_location
-            else 0
-        )
+        # Layer index is the first numeric path component. Scanning per path
+        # (rather than a fixed offset from down_keys[0]) is robust to models
+        # whose module paths vary in depth -- e.g. DeepSeek MTP blocks
+        # (mtp.0.block...) sit at a different depth than model.layers.N.
+        index = next((int(p) for p in path.split(".") if p.isdigit()), 0)
         use_more_bits = (
             index < num_layers // 8
             or index >= 7 * num_layers // 8
