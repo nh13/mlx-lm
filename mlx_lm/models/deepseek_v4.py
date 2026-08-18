@@ -620,51 +620,33 @@ class CompressedKVCache(KVCache):
             merged._buf = mx.concatenate(padded, axis=0)
             merged._buf_count = max_bc
 
+        merged._index_pool = cls._merge_field([c._index_pool for c in caches])
+        merged._index_buf = cls._merge_field([c._index_buf for c in caches])
+        merged._abs_pos = max(c._abs_pos for c in caches)
+        merged._index_abs_pos = max(c._index_abs_pos for c in caches)
+        merged._state_kv = None
+        merged._state_score = None
+
         return merged
 
     def filter(self, batch_indices):
-        if hasattr(self.local, 'filter'):
+        if hasattr(self.local, "filter"):
             self.local.filter(batch_indices)
-        if self._pool is not None:
-            self._pool = self._pool[batch_indices]
-        if self._buf is not None:
-            self._buf = self._buf[batch_indices]
+        for attr in ("_pool", "_buf", "_index_pool", "_index_buf"):
+            v = getattr(self, attr)
+            if v is not None:
+                setattr(self, attr, v[batch_indices])
 
     def extend(self, other):
-        if hasattr(self.local, 'extend'):
+        if hasattr(self.local, "extend"):
             self.local.extend(other.local)
-        # Extend pools
-        if self._pool is None and other._pool is None:
-            pass
-        elif self._pool is None:
-            self._pool = other._pool
-        elif other._pool is None:
-            pass
-        else:
-            max_len = max(self._pool.shape[1], other._pool.shape[1])
-            def pad_pool(p, target):
-                if p.shape[1] < target:
-                    pad = mx.zeros((p.shape[0], target - p.shape[1], p.shape[2]), dtype=p.dtype)
-                    return mx.concatenate([p, pad], axis=1)
-                return p
-            self._pool = mx.concatenate([pad_pool(self._pool, max_len), pad_pool(other._pool, max_len)], axis=0)
-        # Extend buffers
-        if self._buf is None and other._buf is None:
-            pass
-        elif self._buf is None:
-            self._buf = other._buf
-            self._buf_count = other._buf_count
-        elif other._buf is None:
-            pass
-        else:
-            max_bc = max(self._buf.shape[1], other._buf.shape[1])
-            def pad_buf(b, target):
-                if b.shape[1] < target:
-                    pad = mx.zeros((b.shape[0], target - b.shape[1], b.shape[2]), dtype=b.dtype)
-                    return mx.concatenate([b, pad], axis=1)
-                return b
-            self._buf = mx.concatenate([pad_buf(self._buf, max_bc), pad_buf(other._buf, max_bc)], axis=0)
-            self._buf_count = max_bc
+        self._pool = self._extend_field(self._pool, other._pool)
+        self._buf = self._extend_field(self._buf, other._buf)
+        self._buf_count = max(self._buf_count, other._buf_count)
+        self._index_pool = self._extend_field(self._index_pool, other._index_pool)
+        self._index_buf = self._extend_field(self._index_buf, other._index_buf)
+        self._abs_pos = max(self._abs_pos, other._abs_pos)
+        self._index_abs_pos = max(self._index_abs_pos, other._index_abs_pos)
 
     def finalize(self):
         if hasattr(self.local, 'finalize'):
@@ -672,10 +654,17 @@ class CompressedKVCache(KVCache):
 
     def extract(self, idx):
         extracted = CompressedKVCache.__new__(CompressedKVCache)
-        extracted.local = self.local.extract(idx) if hasattr(self.local, 'extract') else self.local
-        extracted._pool = self._pool[idx:idx+1] if self._pool is not None else None
-        extracted._buf = self._buf[idx:idx+1] if self._buf is not None else None
+        extracted.local = self.local.extract(idx) if hasattr(self.local, "extract") else self.local
+        sl = lambda a: a[idx : idx + 1] if a is not None else None
+        extracted._pool = sl(self._pool)
+        extracted._buf = sl(self._buf)
+        extracted._index_pool = sl(self._index_pool)
+        extracted._index_buf = sl(self._index_buf)
         extracted._buf_count = self._buf_count
+        extracted._abs_pos = self._abs_pos
+        extracted._index_abs_pos = self._index_abs_pos
+        extracted._state_kv = None
+        extracted._state_score = None
         return extracted
 
     @property
@@ -683,6 +672,42 @@ class CompressedKVCache(KVCache):
         if hasattr(self.local, 'batch_size'):
             return self.local.batch_size
         return 1
+
+    @staticmethod
+    def _merge_field(arrays):
+        # Pad batch-1 [1, n, D] arrays to max length and stack along batch.
+        if all(a is None for a in arrays):
+            return None
+        present = next(a for a in arrays if a is not None)
+        D, dtype = present.shape[-1], present.dtype
+        max_len = max(a.shape[1] if a is not None else 0 for a in arrays)
+        out = []
+        for a in arrays:
+            if a is None:
+                out.append(mx.zeros((1, max_len, D), dtype=dtype))
+            elif a.shape[1] < max_len:
+                pad = mx.zeros((a.shape[0], max_len - a.shape[1], D), dtype=dtype)
+                out.append(mx.concatenate([a, pad], axis=1))
+            else:
+                out.append(a)
+        return mx.concatenate(out, axis=0)
+
+    @staticmethod
+    def _extend_field(a, b):
+        # Concatenate two [B, n, D] fields along batch, padding to max length.
+        if a is None and b is None:
+            return None
+        if a is None:
+            return b
+        if b is None:
+            return a
+        max_len = max(a.shape[1], b.shape[1])
+        def pad(x):
+            if x.shape[1] < max_len:
+                p = mx.zeros((x.shape[0], max_len - x.shape[1], x.shape[2]), dtype=x.dtype)
+                return mx.concatenate([x, p], axis=1)
+            return x
+        return mx.concatenate([pad(a), pad(b)], axis=0)
 
     @staticmethod
     def _accumulate_window(pool, buf, abs_pos, x, compressor):
