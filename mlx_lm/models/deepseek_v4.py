@@ -843,6 +843,22 @@ class V4Attention(nn.Module):
             out = out + self.wo_a.bias
         return out
 
+    @staticmethod
+    def _rope_at(rope, x_pe, positions):
+        # Interleaved-pair RoPE on x_pe[..., S, dims] at explicit positions[S].
+        dims = rope.dims
+        theta = positions[:, None] * rope.inv_freq[None, :]
+        cos = mx.cos(theta).astype(x_pe.dtype)
+        sin = mx.sin(theta).astype(x_pe.dtype)
+        shape = (1,) * (x_pe.ndim - 2) + cos.shape
+        cos = cos.reshape(shape)
+        sin = sin.reshape(shape)
+        rot = x_pe[..., :dims].reshape(*x_pe.shape[:-1], dims // 2, 2)
+        x0 = rot[..., 0]
+        x1 = rot[..., 1]
+        y = mx.stack((x0 * cos - x1 * sin, x0 * sin + x1 * cos), axis=-1)
+        return y.reshape(x_pe.shape)
+
     def __call__(self, x: mx.array, mask=None, cache=None):
         B, S, _ = x.shape
 
@@ -860,8 +876,9 @@ class V4Attention(nn.Module):
         # Apply RoPE only to the last rope_head_dim dims
         q_nope, q_pe = mx.split(q,  [self.nope_head_dim], axis=-1)
         k_nope, k_pe = mx.split(kv, [self.nope_head_dim], axis=-1)
-        q_pe = self.rope(q_pe, offset=offset)
-        k_pe = self.rope(k_pe, offset=offset)
+        attn_rope = self.compress_rope if self.compress_ratio else self.rope
+        q_pe = attn_rope(q_pe, offset=offset)
+        k_pe = attn_rope(k_pe, offset=offset)
         q = mx.concatenate([q_nope, q_pe], axis=-1)
         k = v = mx.concatenate([k_nope, k_pe], axis=-1)
 
@@ -888,6 +905,14 @@ class V4Attention(nn.Module):
                         )
                         ckv = mx.take_along_axis(ckv, idx, axis=1)
                 compressed_k = ckv[:, None, :, :]
+                # Block i covers tokens [i*ratio, ...); positions are absolute
+                # from sequence start. The pool is never trimmed, so this holds
+                # for cached/continued sequences as well.
+                n_comp = compressed_k.shape[2]
+                comp_pos = mx.arange(n_comp, dtype=mx.float32) * self.compress_ratio
+                ck_nope, ck_pe = mx.split(compressed_k, [self.nope_head_dim], axis=-1)
+                ck_pe = self._rope_at(self.compress_rope, ck_pe, comp_pos)
+                compressed_k = mx.concatenate([ck_nope, ck_pe], axis=-1)
                 compressed_v = compressed_k
 
         # Update KV cache
@@ -916,7 +941,7 @@ class V4Attention(nn.Module):
         )
 
         out_nope, out_pe = mx.split(out, [self.nope_head_dim], axis=-1)
-        out_pe = self.rope(out_pe, offset=offset, inverse=True)
+        out_pe = attn_rope(out_pe, offset=offset, inverse=True)
         out = mx.concatenate([out_nope, out_pe], axis=-1)
 
         # Grouped low-rank projection: [B, n_heads, S, head_dim] -> [B, S, n_heads*head_dim]
