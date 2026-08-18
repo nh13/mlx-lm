@@ -464,6 +464,9 @@ class CompressedKVCache(KVCache):
         self._buf = None
         self._buf_count = 0
         self._abs_pos = 0
+        self._index_pool = None
+        self._index_buf = None
+        self._index_abs_pos = 0
 
     @property
     def offset(self):
@@ -636,42 +639,57 @@ class CompressedKVCache(KVCache):
             return self.local.batch_size
         return 1
 
-    def accumulate(self, x: mx.array, compressor: "Compressor") -> Optional[mx.array]:
-        """Buffer raw tokens and emit compressed rows on window boundaries.
+    @staticmethod
+    def _accumulate_window(pool, buf, abs_pos, x, compressor):
+        """Emit compressed rows for completed windows; return (pool, buf, abs_pos).
 
-        Unified path for prefill (S>1, possibly chunked) and decode (S==1): each
-        compressed row is produced by calling `compressor` over exactly the same
-        raw-token window it would see in a single full-sequence forward, so
-        incremental generation is bit-for-bit consistent with prefill.
-
-        Fixes the decode/chunk divergence where the prefill remainder tokens and
-        the ratio-4 cross-window overlap were dropped from the pool, producing
-        wrong compressed KV at decode (e.g. i32 -> i token drops).
+        Shared by the main compressed KV pool and the indexer pool. Each row is
+        produced by calling `compressor` over exactly the raw-token window a
+        single full-sequence forward would see (retaining the previous window
+        for ratio-4 overlap), so incremental decode is bit-for-bit consistent
+        with prefill, including prefill remainders and chunk boundaries.
         """
         r = compressor.ratio
         overlap = compressor.overlap
-
-        self._buf = x if self._buf is None else mx.concatenate([self._buf, x], axis=1)
-        self._abs_pos += x.shape[1]
-        raw_start = self._abs_pos - self._buf.shape[1]
-        n_rows = 0 if self._pool is None else self._pool.shape[1]
-
-        while (n_rows + 1) * r <= self._abs_pos:
+        buf = x if buf is None else mx.concatenate([buf, x], axis=1)
+        abs_pos += x.shape[1]
+        raw_start = abs_pos - buf.shape[1]
+        n_rows = 0 if pool is None else pool.shape[1]
+        while (n_rows + 1) * r <= abs_pos:
             w = n_rows
             need_start = ((w - 1) * r) if (overlap and w > 0) else (w * r)
             s = need_start - raw_start
             e = (w + 1) * r - raw_start
-            rows = compressor(self._buf[:, s:e])
+            rows = compressor(buf[:, s:e])
             row = rows[:, -1:]
-            self._pool = row if self._pool is None else mx.concatenate([self._pool, row], axis=1)
+            pool = row if pool is None else mx.concatenate([pool, row], axis=1)
             n_rows += 1
-
         keep_abs = max(((n_rows - 1) * r) if overlap else (n_rows * r), 0)
         drop = keep_abs - raw_start
         if drop > 0:
-            self._buf = self._buf[:, drop:]
+            buf = buf[:, drop:]
+        return pool, buf, abs_pos
+
+    def accumulate(self, x: mx.array, compressor: "Compressor") -> Optional[mx.array]:
+        """Main compressed-KV pool: buffer raw tokens, emit rows on boundaries."""
+        self._pool, self._buf, self._abs_pos = self._accumulate_window(
+            self._pool, self._buf, self._abs_pos, x, compressor
+        )
         self._buf_count = 0 if self._buf is None else self._buf.shape[1]
         return self._pool
+
+    def accumulate_index(self, x: mx.array, compressor: "Compressor") -> Optional[mx.array]:
+        """Indexer pool: same windowing as accumulate, separate compressor/state.
+
+        Lets the lightweight index compressor accumulate across decode steps so
+        top-k block selection works during generation (it previously recomputed
+        on the single decode token, produced no rows, and disabled top-k).
+        """
+        self._index_pool, self._index_buf, self._index_abs_pos = self._accumulate_window(
+            self._index_pool, self._index_buf, self._index_abs_pos, x, compressor
+        )
+        return self._index_pool
+
 
 class Compressor(nn.Module):
     """Learned gated pooling over `ratio` consecutive tokens for KV compression.
@@ -894,10 +912,20 @@ class V4Attention(nn.Module):
             else:
                 pool = None
 
+            # Accumulate the indexer pool in lockstep so top-k block
+            # selection works during decode (S==1), not just prefill.
+            index_pool = None
+            if hasattr(self, "indexer"):
+                if comp_cache is not None:
+                    index_pool = comp_cache.accumulate_index(x, self.indexer.compressor)
+                elif S > 1:
+                    index_pool = self.indexer.compressor(x)
+                    index_pool = index_pool if index_pool.shape[1] > 0 else None
+
             if pool is not None:
                 ckv = pool
                 if hasattr(self, "indexer") and ckv.shape[1] > self.args.index_topk:
-                    topk_idx = self.indexer(x, qr)
+                    topk_idx = self.indexer(x, qr, index_pool)
                     if topk_idx is not None:
                         idx = mx.broadcast_to(
                             topk_idx[:, :, None],
@@ -981,6 +1009,7 @@ class Indexer(nn.Module):
         self,
         x: mx.array,
         q_intermediate: mx.array,
+        ck: Optional[mx.array] = None,
     ) -> Optional[mx.array]:
         """Score compressed rows and return topk indices.
 
@@ -994,7 +1023,8 @@ class Indexer(nn.Module):
         """
         B, S, _ = x.shape
 
-        ck = self.compressor(x)
+        if ck is None:
+            ck = self.compressor(x)
         n_compressed = ck.shape[1]
         if n_compressed == 0:
             return None
