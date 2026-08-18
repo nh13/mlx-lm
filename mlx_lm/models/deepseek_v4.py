@@ -461,8 +461,6 @@ class CompressedKVCache(KVCache):
         # Skip KVCache.__init__ — we proxy everything through self.local
         self.local = RotatingKVCache(max_size=max_size, keep=0)
         self._pool = None
-        self._state_kv = None
-        self._state_score = None
         self._buf = None
         self._buf_count = 0
         self._abs_pos = 0
@@ -638,74 +636,42 @@ class CompressedKVCache(KVCache):
             return self.local.batch_size
         return 1
 
-    def accumulate(self, x: mx.array, compressor: 'Compressor') -> Optional[mx.array]:
-        """Buffer tokens and compress when a full window is ready.
+    def accumulate(self, x: mx.array, compressor: "Compressor") -> Optional[mx.array]:
+        """Buffer raw tokens and emit compressed rows on window boundaries.
 
-        Uses ds4-style rolling state: each token is immediately projected through
-        wkv/wgate with correct absolute-position APE, stored in rolling state
-        buffers, and pooled at ratio boundaries via softmax-weighted gating.
+        Unified path for prefill (S>1, possibly chunked) and decode (S==1): each
+        compressed row is produced by calling `compressor` over exactly the same
+        raw-token window it would see in a single full-sequence forward, so
+        incremental generation is bit-for-bit consistent with prefill.
 
-        This fixes the decode-time cache divergence bug where buffer-relative APE
-        indices caused wrong KV at decode S=1 (see: anerjy's report on PR #1189,
-        cross-validated against antirez/ds4 reference at ds4.c:6970-7034).
-
-        Args:
-            x: [B, S, D] hidden states for current step(s)
-            compressor: the Compressor module to apply
-
-        Returns:
-            The full compressed pool [B, N_compressed, head_dim], or None if empty.
+        Fixes the decode/chunk divergence where the prefill remainder tokens and
+        the ratio-4 cross-window overlap were dropped from the pool, producing
+        wrong compressed KV at decode (e.g. i32 -> i token drops).
         """
-        B, S, D = x.shape
         r = compressor.ratio
+        overlap = compressor.overlap
 
-        if S > 1:
-            ckv = compressor(x)
-            if ckv.shape[1] > 0:
-                self._pool = ckv if self._pool is None else mx.concatenate([self._pool, ckv], axis=1)
-            remainder = S % r
-            if remainder > 0:
-                self._buf = x[:, -remainder:]
-                self._buf_count = remainder
-            else:
-                self._buf = None
-                self._buf_count = 0
-            self._abs_pos = S
-            self._state_kv = None
-            self._state_score = None
-            return self._pool
+        self._buf = x if self._buf is None else mx.concatenate([self._buf, x], axis=1)
+        self._abs_pos += x.shape[1]
+        raw_start = self._abs_pos - self._buf.shape[1]
+        n_rows = 0 if self._pool is None else self._pool.shape[1]
 
-        coff = 2 if compressor.overlap else 1
-        width = coff * compressor.head_dim
-        pos = self._abs_pos
-        pos_mod = pos % r
+        while (n_rows + 1) * r <= self._abs_pos:
+            w = n_rows
+            need_start = ((w - 1) * r) if (overlap and w > 0) else (w * r)
+            s = need_start - raw_start
+            e = (w + 1) * r - raw_start
+            rows = compressor(self._buf[:, s:e])
+            row = rows[:, -1:]
+            self._pool = row if self._pool is None else mx.concatenate([self._pool, row], axis=1)
+            n_rows += 1
 
-        xf = x.astype(mx.float32)
-        kv_cur = compressor.wkv(xf)
-        sc_cur = compressor.wgate(xf)
-        sc_cur = sc_cur + compressor.ape[pos_mod:pos_mod+1]
-
-        if self._state_kv is None:
-            self._state_kv = mx.zeros((B, r if not compressor.overlap else 2 * r, width), dtype=mx.float32)
-            self._state_score = mx.full((B, r if not compressor.overlap else 2 * r, width), float('-inf'), dtype=mx.float32)
-
-        row = (r + pos_mod) if compressor.overlap else pos_mod
-        self._state_kv[:, row:row+1, :] = kv_cur
-        self._state_score[:, row:row+1, :] = sc_cur
-
-        self._abs_pos = pos + 1
-
-        if (pos + 1) % r == 0:
-            weights = mx.softmax(self._state_score, axis=1, precise=True)
-            pooled = (self._state_kv * weights).sum(axis=1, keepdims=True)
-            pooled = pooled[:, :, :compressor.head_dim]
-            ckv = compressor.norm(pooled.astype(x.dtype))
-            self._pool = ckv if self._pool is None else mx.concatenate([self._pool, ckv], axis=1)
-            self._state_kv = None
-            self._state_score = None
-
+        keep_abs = max(((n_rows - 1) * r) if overlap else (n_rows * r), 0)
+        drop = keep_abs - raw_start
+        if drop > 0:
+            self._buf = self._buf[:, drop:]
+        self._buf_count = 0 if self._buf is None else self._buf.shape[1]
         return self._pool
-
 
 class Compressor(nn.Module):
     """Learned gated pooling over `ratio` consecutive tokens for KV compression.
