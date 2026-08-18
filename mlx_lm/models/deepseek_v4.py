@@ -1117,6 +1117,7 @@ class DeepseekV4Model(nn.Module, PipelineMixin):
         mask = create_attention_mask(
             h[:, :, 0, :],
             first_cache if first_cache is not None else None,
+            window_size=self.args.sliding_window,
             return_array=True,
         )
 
