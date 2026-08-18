@@ -1705,6 +1705,36 @@ class TestModels(unittest.TestCase):
         mx.eval(outputs)
         self.assertEqual(outputs.shape, (1, 1, args.vocab_size))
 
+    def test_deepseek_v4_prompt_cache_roundtrip(self):
+        # Regression: saving/loading a compressed-attention prompt cache must
+        # preserve the compressed pool, indexer pool and raw buffers, so that
+        # continued generation from a restored cache matches the live cache.
+        import os
+        import tempfile
+        from mlx_lm.models import deepseek_v4
+        from mlx_lm.models.cache import load_prompt_cache, save_prompt_cache
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4", vocab_size=128, hidden_size=64,
+            num_hidden_layers=4, num_attention_heads=4, q_lora_rank=16,
+            o_lora_rank=8, o_groups=2, head_dim=16, qk_rope_head_dim=4,
+            sliding_window=16, compress_ratios=[0, 0, 4, 0], index_n_heads=4,
+            index_head_dim=8, index_topk=4, moe_intermediate_size=16,
+            n_routed_experts=4, n_shared_experts=1, num_experts_per_tok=2,
+            num_hash_layers=1, hc_mult=2, hc_sinkhorn_iters=2,
+        )
+        model = deepseek_v4.Model(args)
+        ids = (mx.arange(20) % 128).reshape(1, 20)
+        nxt = mx.array([[7]])
+        cache = model.make_cache()
+        mx.eval(model(ids, cache=cache))
+        path = os.path.join(tempfile.mkdtemp(), "c.safetensors")
+        save_prompt_cache(path, cache)
+        live = mx.array(model(nxt, cache=cache))[0, -1]
+        restored = load_prompt_cache(path)
+        rest = mx.array(model(nxt, cache=restored))[0, -1]
+        self.assertTrue(mx.allclose(live, rest, atol=1e-4))
+
     def test_deepseek_v4_indexer_decode_topk(self):
         # Regression: the indexer pool must accumulate across decode steps so
         # top-k block selection works during generation. Previously the indexer

@@ -497,11 +497,24 @@ class CompressedKVCache(KVCache):
 
     @property
     def state(self):
-        return self.local.state
+        ls = self.local.state
+        ls = ls if isinstance(ls, tuple) else (ls,)
+        empty = mx.array([], dtype=mx.bfloat16)
+        extra = tuple(
+            a if a is not None else empty
+            for a in (self._pool, self._buf, self._index_pool, self._index_buf)
+        )
+        return (*ls, *extra)
 
     @state.setter
     def state(self, value):
-        self.local.state = value
+        *ls, pool, buf, ipool, ibuf = value
+        self.local.state = tuple(ls) if len(ls) != 1 else ls[0]
+        self._pool = pool if pool.size > 0 else None
+        self._buf = buf if buf.size > 0 else None
+        self._index_pool = ipool if ipool.size > 0 else None
+        self._index_buf = ibuf if ibuf.size > 0 else None
+        self._buf_count = 0 if self._buf is None else self._buf.shape[1]
 
     @property
     def nbytes(self):
@@ -510,15 +523,43 @@ class CompressedKVCache(KVCache):
             n += self._pool.nbytes
         if self._buf is not None:
             n += self._buf.nbytes
+        if self._index_pool is not None:
+            n += self._index_pool.nbytes
+        if self._index_buf is not None:
+            n += self._index_buf.nbytes
         return n
 
     @property
     def meta_state(self):
-        return self.local.meta_state
+        return (
+            self.local.meta_state,
+            str(self._buf_count),
+            str(self._abs_pos),
+            str(self._index_abs_pos),
+        )
 
     @meta_state.setter
     def meta_state(self, value):
-        self.local.meta_state = value
+        self.local.meta_state = value[0]
+        self._buf_count = int(value[1])
+        self._abs_pos = int(value[2])
+        self._index_abs_pos = int(value[3])
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        obj = cls.__new__(cls)
+        *ls, pool, buf, ipool, ibuf = state
+        obj.local = RotatingKVCache.from_state(
+            tuple(ls) if len(ls) != 1 else ls[0], meta_state[0]
+        )
+        obj._pool = pool if pool.size > 0 else None
+        obj._buf = buf if buf.size > 0 else None
+        obj._index_pool = ipool if ipool.size > 0 else None
+        obj._index_buf = ibuf if ibuf.size > 0 else None
+        obj._buf_count = int(meta_state[1])
+        obj._abs_pos = int(meta_state[2])
+        obj._index_abs_pos = int(meta_state[3])
+        return obj
 
     def is_trimmable(self):
         return self.local.is_trimmable()
