@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import importlib
+
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 from .base import create_causal_mask
@@ -40,6 +42,19 @@ def make_prompt_cache(
         return [KVCache() for _ in range(num_layers)]
 
 
+def _resolve_cache_class(name):
+    """Resolve a cache class from a (possibly module-qualified) name.
+
+    New caches are saved as ``module.ClassName`` so model-specific cache
+    classes (e.g. deepseek_v4.CompressedKVCache) can be imported on load.
+    Bare names from older cache files fall back to this module globals.
+    """
+    if "." in name:
+        module_name, class_name = name.rsplit(".", 1)
+        return getattr(importlib.import_module(module_name), class_name)
+    return globals()[name]
+
+
 def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str] = {}):
     """
     Save a pre-computed prompt cache to a file.
@@ -53,7 +68,7 @@ def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str]
     cache_data = [c.state for c in cache]
     cache_info = [c.meta_state for c in cache]
     cache_data = dict(tree_flatten(cache_data))
-    cache_classes = [type(c).__name__ for c in cache]
+    cache_classes = [type(c).__module__ + "." + type(c).__name__ for c in cache]
     cache_metadata = [cache_info, metadata, cache_classes]
     cache_metadata = dict(tree_flatten(cache_metadata))
     mx.save_safetensors(file_name, cache_data, cache_metadata)
@@ -77,7 +92,7 @@ def load_prompt_cache(file_name, return_metadata=False):
     cache_metadata = tree_unflatten(list(cache_metadata.items()))
     info, metadata, classes = cache_metadata
     cache = [
-        globals()[c].from_state(state, meta_state)
+        _resolve_cache_class(c).from_state(state, meta_state)
         for c, state, meta_state in zip(classes, arrays, info)
     ]
     if return_metadata:
