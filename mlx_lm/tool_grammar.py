@@ -33,8 +33,12 @@ otherwise ``string="false"``).
 ``tool_choice`` semantics (OpenAI-compatible):
 
 * ``"required"`` / ``{"type": "function", "function": {"name": N}}`` -- *force* a
-  tool call (optionally a specific tool ``N``) from the first generated token.
-  This is the mode that rescues a degraded model.
+  tool call (optionally a specific tool ``N``). This is the mode that rescues a
+  degraded model. When the prompt opens a thinking block (the ``deepseek_v4``
+  template ends a thinking-mode prompt with ``<think>``), the block is forced
+  only *after* the model closes ``</think>`` -- forcing from token 0 would
+  truncate the model's reasoning and yield an empty ``finish=stop``. In chat mode
+  the prompt already ends with ``</think>``, so the block is forced immediately.
 * ``"auto"`` -- let the model answer in prose until it emits the ``｜DSML｜``
   special token (which it reliably gets right, and which only appears when it
   intends a tool call); from that point the block is forced.
@@ -53,7 +57,6 @@ from __future__ import annotations
 from typing import Any, Callable, List, Optional, Tuple
 
 import mlx.core as mx
-import numpy as np
 
 # The core DSML delimiter special token; the model emits this reliably.
 _DSML = "｜DSML｜"
@@ -77,6 +80,17 @@ _VALUE_MAX_TOKENS = 512  # runaway guard for a free value region
 def _encode(tokenizer, text: str) -> Tuple[int, ...]:
     """Token ids for ``text`` with no added BOS/EOS -- matches server delimiters."""
     return tuple(tokenizer.encode(text, add_special_tokens=False))
+
+
+def _last_id(tokenizer, text: str) -> Optional[int]:
+    """The final token id of ``text`` (its whole id if a single token), or ``None``.
+
+    Used to detect a marker's completion in the generated stream: a special token
+    like ``</think>`` encodes to a single id, and even if it were multi-token, the
+    marker is complete exactly when its last token appears.
+    """
+    ids = _encode(tokenizer, text)
+    return ids[-1] if ids else None
 
 
 def _suffix_after(seg: Tuple[int, ...], prefix: Tuple[int, ...]) -> Tuple[int, ...]:
@@ -115,6 +129,56 @@ def _named_choice(tool_choice: Any) -> Optional[str]:
     return None
 
 
+class _MaskCache:
+    """Caches additive logit masks as on-device ``mx`` arrays, keyed by id-set.
+
+    A logits processor must return a full-vocab-shaped array every step, so one
+    vocab-sized op per token is unavoidable. The cost this removes is (a) building
+    that vector in ``numpy`` and copying it host->device *every* token (the old
+    ``np.full((vocab,), ...)`` path forced a host allocation and a device sync per
+    step), and (b) rebuilding the handful of *constant* masks that recur for the
+    bulk of a call -- the value-region ``｜DSML｜`` deny mask (one per value token,
+    and values dominate the token count) and the ``<`` / ``</`` open-or-close
+    choice. Each distinct mask is materialized once, on-device, in the logits
+    dtype, then reused; the number of distinct masks in a tool-call grammar is
+    small (structural tokens + a few name/param positions), so the cache stays
+    tiny and never needs eviction.
+    """
+
+    def __init__(self, vocab: int, dtype: Any) -> None:
+        self._vocab = vocab
+        self._dtype = dtype
+        self._allow: dict = {}
+        self._deny: dict = {}
+
+    def _clamp(self, ids) -> frozenset:
+        return frozenset(i for i in ids if 0 <= i < self._vocab)
+
+    def allow(self, ids) -> mx.array:
+        """Additive mask: ``0`` at ``ids``, ``_MASK_FILL`` everywhere else."""
+        key = self._clamp(ids)
+        mask = self._allow.get(key)
+        if mask is None:
+            mask = mx.full((self._vocab,), _MASK_FILL, dtype=self._dtype)
+            if key:
+                mask[mx.array(sorted(key))] = 0.0
+            mx.eval(mask)  # materialize once so reuse is a leaf, not a rebuilt graph
+            self._allow[key] = mask
+        return mask
+
+    def deny(self, ids) -> mx.array:
+        """Additive mask: ``_MASK_FILL`` at ``ids``, ``0`` everywhere else."""
+        key = self._clamp(ids)
+        mask = self._deny.get(key)
+        if mask is None:
+            mask = mx.zeros((self._vocab,), dtype=self._dtype)
+            if key:
+                mask[mx.array(sorted(key))] = _MASK_FILL
+            mx.eval(mask)
+            self._deny[key] = mask
+        return mask
+
+
 class _ToolGrammarState:
     """Per-request decode state backing one logits processor.
 
@@ -140,27 +204,23 @@ class _ToolGrammarState:
         self._pname_map: dict = {}
         self._pending_is_str = False
         self._value_tokens = 0
-        if grammar.force:
-            self._begin_force(grammar.open, then="inv_head")
-        else:
-            self._phase = "decide"
+        self._cache: Optional[_MaskCache] = None  # lazily built once vocab+dtype known
+        # The concrete start phase for ``force`` mode is resolved on the first
+        # call (``_on_prompt``), once we can see whether the prompt sits inside an
+        # open ``<think>`` block. ``decide`` is the auto-mode default until then.
+        self._phase = "decide"
 
     # -- masking helpers --------------------------------------------------
+    def _mask_cache(self, logits: mx.array) -> _MaskCache:
+        if self._cache is None:
+            self._cache = _MaskCache(logits.shape[-1], logits.dtype)
+        return self._cache
+
     def _allow(self, logits: mx.array, allowed) -> mx.array:
-        v = logits.shape[-1]
-        add = np.full((v,), _MASK_FILL, dtype=np.float32)
-        idx = [t for t in allowed if 0 <= t < v]
-        if idx:
-            add[idx] = 0.0
-        return logits + mx.array(add)[None].astype(logits.dtype)
+        return logits + self._mask_cache(logits).allow(allowed)
 
     def _deny(self, logits: mx.array, denied) -> mx.array:
-        v = logits.shape[-1]
-        add = np.zeros((v,), dtype=np.float32)
-        for t in denied:
-            if 0 <= t < v:
-                add[t] = _MASK_FILL
-        return logits + mx.array(add)[None].astype(logits.dtype)
+        return logits + self._mask_cache(logits).deny(denied)
 
     # -- phase entry helpers ---------------------------------------------
     def _begin_force(self, seg: Tuple[int, ...], then: str) -> None:
@@ -189,16 +249,41 @@ class _ToolGrammarState:
         n = int(tokens.shape[-1])
         if self._prompt_len is None:
             self._prompt_len = n
+            self._on_prompt(tokens)
         generated = n - self._prompt_len
         while self._consumed < generated:
             self._advance(int(tokens[self._prompt_len + self._consumed]))
             self._consumed += 1
         return self._mask(logits)
 
+    def _on_prompt(self, tokens: mx.array) -> None:
+        """Resolve the ``force``-mode start phase from the prompt's tail.
+
+        A thinking-mode prompt ends with ``<think>`` (generation begins inside the
+        reasoning block); a chat-mode prompt ends with ``</think>``. In the former
+        we wait for the model to close ``</think>`` before forcing the block; in
+        the latter (and whenever the marker can't be resolved) we force at once.
+        Auto mode is unaffected -- it stays in ``decide`` until the model emits
+        ``｜DSML｜`` on its own.
+        """
+        if not self._g.force:
+            return
+        last = int(tokens[-1]) if int(tokens.shape[-1]) else -1
+        in_think = self._g.think_start_id is not None and last == self._g.think_start_id
+        if in_think and self._g.think_end_id is not None:
+            self._phase = "await_think"
+        else:
+            self._begin_force(self._g.open, then="inv_head")
+
     # -- transitions ------------------------------------------------------
     def _advance(self, tok: int) -> None:
         p = self._phase
         if p in ("done", "prose"):
+            return
+        if p == "await_think":
+            if tok == self._g.think_end_id:
+                # model closed </think>; now force the tool-call block
+                self._begin_force(self._g.open, then="inv_head")
             return
         if p == "decide":
             if tok == self._g.dsml_id:
@@ -285,7 +370,7 @@ class _ToolGrammarState:
     # -- per-step mask ----------------------------------------------------
     def _mask(self, logits: mx.array) -> mx.array:
         p = self._phase
-        if p in ("decide", "done", "prose"):
+        if p in ("decide", "await_think", "done", "prose"):
             return logits
         if p == "force":
             return self._allow(logits, (self._seg[0],)) if self._seg else logits
@@ -327,6 +412,11 @@ class ToolCallGrammar:
         self.dsml_id = _encode(tokenizer, _DSML)[0]  # ｜DSML｜
         self.lt_id = _encode(tokenizer, "<")[0]      # `<`  opens a tag
         self.close_id = _encode(tokenizer, "</")[0]  # `</` opens a close tag
+
+        # Thinking-block markers (single special tokens in the DeepSeek vocab);
+        # used only in force mode to defer forcing until the model closes </think>.
+        self.think_start_id = _last_id(tokenizer, "<think>")
+        self.think_end_id = _last_id(tokenizer, "</think>")
 
         # Suffixes forced after the model emits the opener token on its own.
         self.param_head_after_lt = _suffix_after(self.param_head, (self.lt_id,))
