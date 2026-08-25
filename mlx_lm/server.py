@@ -203,6 +203,8 @@ class CompletionRequest:
     messages: List[Any]
     tools: Optional[List[Any]]
     role_mapping: Optional[Dict[str, Any]]
+    tool_choice: Any = "auto"
+    constrained_tools: bool = False
 
 
 @dataclass
@@ -416,6 +418,24 @@ def _make_sampler(args, tokenizer):
             tokenizer.encode("\n"),
         ],
     )
+
+
+def _tool_grammar_processors(base, request, tokenizer):
+    """Append a DeepSeek tool-call grammar constraint when the request opts
+    in via ``constrained_tools`` on a tools request. Default off — returns
+    ``base`` unchanged — so ordinary requests are unaffected.
+    """
+    if not getattr(request, "constrained_tools", False):
+        return base
+    tools = getattr(request, "tools", None)
+    choice = getattr(request, "tool_choice", "auto")
+    if not tools or choice == "none" or not getattr(
+        tokenizer, "has_tool_calling", False
+    ):
+        return base
+    from .tool_grammar import ToolCallGrammar
+    proc = ToolCallGrammar(tokenizer, tools, choice).logits_processor()
+    return list(base or []) + [proc]
 
 
 def _make_logits_processors(args):
@@ -786,7 +806,11 @@ class ResponseGenerator:
                         caches=[cache],
                         all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, tokenizer)],
-                        logits_processors=[_make_logits_processors(args)],
+                        logits_processors=[
+                            _tool_grammar_processors(
+                                _make_logits_processors(args), request, tokenizer
+                            )
+                        ],
                         state_machines=[sm],
                     )
                     batch_results[uid] = {
@@ -965,7 +989,9 @@ class ResponseGenerator:
 
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
-            logits_processors = _make_logits_processors(args)
+            logits_processors = _tool_grammar_processors(
+                _make_logits_processors(args), request, tokenizer
+            )
 
             # Load the KV cache
             self._log_cache_stats()
@@ -1604,6 +1630,8 @@ class APIHandler(BaseHTTPRequestHandler):
             body["messages"],
             body.get("tools") or None,
             body.get("role_mapping"),
+            body.get("tool_choice", "auto"),
+            bool(body.get("constrained_tools", False)),
         )
 
     def handle_text_completions(self) -> CompletionRequest:
