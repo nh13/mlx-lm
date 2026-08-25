@@ -53,9 +53,10 @@ def mixed_quant_predicate_builder(
         Ref: https://github.com/ggerganov/llama.cpp/blob/917786f43d0f29b7c77a0c56767c0fa4df68b1c5/src/llama.cpp#L5265
         By Alex Barron: https://gist.github.com/barronalex/84addb8078be21969f1690c1454855f3
         """
+        parts = path.split(".")
         index = (
-            int(path.split(".")[layer_location])
-            if len(path.split(".")) > layer_location
+            int(parts[layer_location])
+            if len(parts) > layer_location and parts[layer_location].isdigit()
             else 0
         )
         use_more_bits = (
