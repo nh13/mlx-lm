@@ -461,11 +461,12 @@ class CompressedKVCache(KVCache):
         # Skip KVCache.__init__ — we proxy everything through self.local
         self.local = RotatingKVCache(max_size=max_size, keep=0)
         self._pool = None
-        self._state_kv = None
-        self._state_score = None
         self._buf = None
         self._buf_count = 0
         self._abs_pos = 0
+        self._index_pool = None
+        self._index_buf = None
+        self._index_abs_pos = 0
 
     @property
     def offset(self):
@@ -496,11 +497,24 @@ class CompressedKVCache(KVCache):
 
     @property
     def state(self):
-        return self.local.state
+        ls = self.local.state
+        ls = ls if isinstance(ls, tuple) else (ls,)
+        empty = mx.array([], dtype=mx.bfloat16)
+        extra = tuple(
+            a if a is not None else empty
+            for a in (self._pool, self._buf, self._index_pool, self._index_buf)
+        )
+        return (*ls, *extra)
 
     @state.setter
     def state(self, value):
-        self.local.state = value
+        *ls, pool, buf, ipool, ibuf = value
+        self.local.state = tuple(ls) if len(ls) != 1 else ls[0]
+        self._pool = pool if pool.size > 0 else None
+        self._buf = buf if buf.size > 0 else None
+        self._index_pool = ipool if ipool.size > 0 else None
+        self._index_buf = ibuf if ibuf.size > 0 else None
+        self._buf_count = 0 if self._buf is None else self._buf.shape[1]
 
     @property
     def nbytes(self):
@@ -509,15 +523,43 @@ class CompressedKVCache(KVCache):
             n += self._pool.nbytes
         if self._buf is not None:
             n += self._buf.nbytes
+        if self._index_pool is not None:
+            n += self._index_pool.nbytes
+        if self._index_buf is not None:
+            n += self._index_buf.nbytes
         return n
 
     @property
     def meta_state(self):
-        return self.local.meta_state
+        return (
+            self.local.meta_state,
+            str(self._buf_count),
+            str(self._abs_pos),
+            str(self._index_abs_pos),
+        )
 
     @meta_state.setter
     def meta_state(self, value):
-        self.local.meta_state = value
+        self.local.meta_state = value[0]
+        self._buf_count = int(value[1])
+        self._abs_pos = int(value[2])
+        self._index_abs_pos = int(value[3])
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        obj = cls.__new__(cls)
+        *ls, pool, buf, ipool, ibuf = state
+        obj.local = RotatingKVCache.from_state(
+            tuple(ls) if len(ls) != 1 else ls[0], meta_state[0]
+        )
+        obj._pool = pool if pool.size > 0 else None
+        obj._buf = buf if buf.size > 0 else None
+        obj._index_pool = ipool if ipool.size > 0 else None
+        obj._index_buf = ibuf if ibuf.size > 0 else None
+        obj._buf_count = int(meta_state[1])
+        obj._abs_pos = int(meta_state[2])
+        obj._index_abs_pos = int(meta_state[3])
+        return obj
 
     def is_trimmable(self):
         return self.local.is_trimmable()
@@ -574,62 +616,49 @@ class CompressedKVCache(KVCache):
             merged._buf = mx.concatenate(padded, axis=0)
             merged._buf_count = max_bc
 
+        merged._index_pool = cls._merge_field([c._index_pool for c in caches])
+        merged._index_buf = cls._merge_field([c._index_buf for c in caches])
+        merged._abs_pos = max(c._abs_pos for c in caches)
+        merged._index_abs_pos = max(c._index_abs_pos for c in caches)
+
         return merged
 
     def filter(self, batch_indices):
-        if hasattr(self.local, 'filter'):
+        if hasattr(self.local, "filter"):
             self.local.filter(batch_indices)
-        if self._pool is not None:
-            self._pool = self._pool[batch_indices]
-        if self._buf is not None:
-            self._buf = self._buf[batch_indices]
+        for attr in ("_pool", "_buf", "_index_pool", "_index_buf"):
+            v = getattr(self, attr)
+            if v is not None:
+                setattr(self, attr, v[batch_indices])
 
     def extend(self, other):
-        if hasattr(self.local, 'extend'):
+        if hasattr(self.local, "extend"):
             self.local.extend(other.local)
-        # Extend pools
-        if self._pool is None and other._pool is None:
-            pass
-        elif self._pool is None:
-            self._pool = other._pool
-        elif other._pool is None:
-            pass
-        else:
-            max_len = max(self._pool.shape[1], other._pool.shape[1])
-            def pad_pool(p, target):
-                if p.shape[1] < target:
-                    pad = mx.zeros((p.shape[0], target - p.shape[1], p.shape[2]), dtype=p.dtype)
-                    return mx.concatenate([p, pad], axis=1)
-                return p
-            self._pool = mx.concatenate([pad_pool(self._pool, max_len), pad_pool(other._pool, max_len)], axis=0)
-        # Extend buffers
-        if self._buf is None and other._buf is None:
-            pass
-        elif self._buf is None:
-            self._buf = other._buf
-            self._buf_count = other._buf_count
-        elif other._buf is None:
-            pass
-        else:
-            max_bc = max(self._buf.shape[1], other._buf.shape[1])
-            def pad_buf(b, target):
-                if b.shape[1] < target:
-                    pad = mx.zeros((b.shape[0], target - b.shape[1], b.shape[2]), dtype=b.dtype)
-                    return mx.concatenate([b, pad], axis=1)
-                return b
-            self._buf = mx.concatenate([pad_buf(self._buf, max_bc), pad_buf(other._buf, max_bc)], axis=0)
-            self._buf_count = max_bc
+        self._pool = self._extend_field(self._pool, other._pool)
+        self._buf = self._extend_field(self._buf, other._buf)
+        self._buf_count = max(self._buf_count, other._buf_count)
+        self._index_pool = self._extend_field(self._index_pool, other._index_pool)
+        self._index_buf = self._extend_field(self._index_buf, other._index_buf)
+        self._abs_pos = max(self._abs_pos, other._abs_pos)
+        self._index_abs_pos = max(self._index_abs_pos, other._index_abs_pos)
 
     def finalize(self):
-        if hasattr(self.local, 'finalize'):
+        if hasattr(self.local, "finalize"):
             self.local.finalize()
 
     def extract(self, idx):
         extracted = CompressedKVCache.__new__(CompressedKVCache)
-        extracted.local = self.local.extract(idx) if hasattr(self.local, 'extract') else self.local
-        extracted._pool = self._pool[idx:idx+1] if self._pool is not None else None
-        extracted._buf = self._buf[idx:idx+1] if self._buf is not None else None
+        extracted.local = self.local.extract(idx) if hasattr(self.local, "extract") else self.local
+        def sl(a):
+            return a[idx : idx + 1] if a is not None else None
+
+        extracted._pool = sl(self._pool)
+        extracted._buf = sl(self._buf)
+        extracted._index_pool = sl(self._index_pool)
+        extracted._index_buf = sl(self._index_buf)
         extracted._buf_count = self._buf_count
+        extracted._abs_pos = self._abs_pos
+        extracted._index_abs_pos = self._index_abs_pos
         return extracted
 
     @property
@@ -638,73 +667,92 @@ class CompressedKVCache(KVCache):
             return self.local.batch_size
         return 1
 
-    def accumulate(self, x: mx.array, compressor: 'Compressor') -> Optional[mx.array]:
-        """Buffer tokens and compress when a full window is ready.
-
-        Uses ds4-style rolling state: each token is immediately projected through
-        wkv/wgate with correct absolute-position APE, stored in rolling state
-        buffers, and pooled at ratio boundaries via softmax-weighted gating.
-
-        This fixes the decode-time cache divergence bug where buffer-relative APE
-        indices caused wrong KV at decode S=1 (see: anerjy's report on PR #1189,
-        cross-validated against antirez/ds4 reference at ds4.c:6970-7034).
-
-        Args:
-            x: [B, S, D] hidden states for current step(s)
-            compressor: the Compressor module to apply
-
-        Returns:
-            The full compressed pool [B, N_compressed, head_dim], or None if empty.
-        """
-        B, S, D = x.shape
-        r = compressor.ratio
-
-        if S > 1:
-            ckv = compressor(x)
-            if ckv.shape[1] > 0:
-                self._pool = ckv if self._pool is None else mx.concatenate([self._pool, ckv], axis=1)
-            remainder = S % r
-            if remainder > 0:
-                self._buf = x[:, -remainder:]
-                self._buf_count = remainder
+    @staticmethod
+    def _merge_field(arrays):
+        # Pad batch-1 [1, n, D] arrays to max length and stack along batch.
+        if all(a is None for a in arrays):
+            return None
+        present = next(a for a in arrays if a is not None)
+        D, dtype = present.shape[-1], present.dtype
+        max_len = max(a.shape[1] if a is not None else 0 for a in arrays)
+        out = []
+        for a in arrays:
+            if a is None:
+                out.append(mx.zeros((1, max_len, D), dtype=dtype))
+            elif a.shape[1] < max_len:
+                pad = mx.zeros((a.shape[0], max_len - a.shape[1], D), dtype=dtype)
+                out.append(mx.concatenate([a, pad], axis=1))
             else:
-                self._buf = None
-                self._buf_count = 0
-            self._abs_pos = S
-            self._state_kv = None
-            self._state_score = None
-            return self._pool
+                out.append(a)
+        return mx.concatenate(out, axis=0)
 
-        coff = 2 if compressor.overlap else 1
-        width = coff * compressor.head_dim
-        pos = self._abs_pos
-        pos_mod = pos % r
+    @staticmethod
+    def _extend_field(a, b):
+        # Concatenate two [B, n, D] fields along batch, padding to max length.
+        if a is None and b is None:
+            return None
+        if a is None:
+            return b
+        if b is None:
+            return a
+        max_len = max(a.shape[1], b.shape[1])
+        def pad(x):
+            if x.shape[1] < max_len:
+                p = mx.zeros((x.shape[0], max_len - x.shape[1], x.shape[2]), dtype=x.dtype)
+                return mx.concatenate([x, p], axis=1)
+            return x
+        return mx.concatenate([pad(a), pad(b)], axis=0)
 
-        xf = x.astype(mx.float32)
-        kv_cur = compressor.wkv(xf)
-        sc_cur = compressor.wgate(xf)
-        sc_cur = sc_cur + compressor.ape[pos_mod:pos_mod+1]
+    @staticmethod
+    def _accumulate_window(pool, buf, abs_pos, x, compressor):
+        """Emit compressed rows for completed windows; return (pool, buf, abs_pos).
 
-        if self._state_kv is None:
-            self._state_kv = mx.zeros((B, r if not compressor.overlap else 2 * r, width), dtype=mx.float32)
-            self._state_score = mx.full((B, r if not compressor.overlap else 2 * r, width), float('-inf'), dtype=mx.float32)
+        Shared by the main compressed KV pool and the indexer pool. Each row is
+        produced by calling `compressor` over exactly the raw-token window a
+        single full-sequence forward would see (retaining the previous window
+        for ratio-4 overlap), so incremental decode is bit-for-bit consistent
+        with prefill, including prefill remainders and chunk boundaries.
+        """
+        r = compressor.ratio
+        overlap = compressor.overlap
+        buf = x if buf is None else mx.concatenate([buf, x], axis=1)
+        abs_pos += x.shape[1]
+        raw_start = abs_pos - buf.shape[1]
+        n_rows = 0 if pool is None else pool.shape[1]
+        while (n_rows + 1) * r <= abs_pos:
+            w = n_rows
+            need_start = ((w - 1) * r) if (overlap and w > 0) else (w * r)
+            s = need_start - raw_start
+            e = (w + 1) * r - raw_start
+            rows = compressor(buf[:, s:e])
+            row = rows[:, -1:]
+            pool = row if pool is None else mx.concatenate([pool, row], axis=1)
+            n_rows += 1
+        keep_abs = max(((n_rows - 1) * r) if overlap else (n_rows * r), 0)
+        drop = keep_abs - raw_start
+        if drop > 0:
+            buf = buf[:, drop:]
+        return pool, buf, abs_pos
 
-        row = (r + pos_mod) if compressor.overlap else pos_mod
-        self._state_kv[:, row:row+1, :] = kv_cur
-        self._state_score[:, row:row+1, :] = sc_cur
-
-        self._abs_pos = pos + 1
-
-        if (pos + 1) % r == 0:
-            weights = mx.softmax(self._state_score, axis=1, precise=True)
-            pooled = (self._state_kv * weights).sum(axis=1, keepdims=True)
-            pooled = pooled[:, :, :compressor.head_dim]
-            ckv = compressor.norm(pooled.astype(x.dtype))
-            self._pool = ckv if self._pool is None else mx.concatenate([self._pool, ckv], axis=1)
-            self._state_kv = None
-            self._state_score = None
-
+    def accumulate(self, x: mx.array, compressor: "Compressor") -> Optional[mx.array]:
+        """Main compressed-KV pool: buffer raw tokens, emit rows on boundaries."""
+        self._pool, self._buf, self._abs_pos = self._accumulate_window(
+            self._pool, self._buf, self._abs_pos, x, compressor
+        )
+        self._buf_count = 0 if self._buf is None else self._buf.shape[1]
         return self._pool
+
+    def accumulate_index(self, x: mx.array, compressor: "Compressor") -> Optional[mx.array]:
+        """Indexer pool: same windowing as accumulate, separate compressor/state.
+
+        Lets the lightweight index compressor accumulate across decode steps so
+        top-k block selection works during generation (it previously recomputed
+        on the single decode token, produced no rows, and disabled top-k).
+        """
+        self._index_pool, self._index_buf, self._index_abs_pos = self._accumulate_window(
+            self._index_pool, self._index_buf, self._index_abs_pos, x, compressor
+        )
+        return self._index_pool
 
 
 class Compressor(nn.Module):
@@ -877,6 +925,22 @@ class V4Attention(nn.Module):
             out = out + self.wo_a.bias
         return out
 
+    @staticmethod
+    def _rope_at(rope, x_pe, positions):
+        # Interleaved-pair RoPE on x_pe[..., S, dims] at explicit positions[S].
+        dims = rope.dims
+        theta = positions[:, None] * rope.inv_freq[None, :]
+        cos = mx.cos(theta).astype(x_pe.dtype)
+        sin = mx.sin(theta).astype(x_pe.dtype)
+        shape = (1,) * (x_pe.ndim - 2) + cos.shape
+        cos = cos.reshape(shape)
+        sin = sin.reshape(shape)
+        rot = x_pe[..., :dims].reshape(*x_pe.shape[:-1], dims // 2, 2)
+        x0 = rot[..., 0]
+        x1 = rot[..., 1]
+        y = mx.stack((x0 * cos - x1 * sin, x0 * sin + x1 * cos), axis=-1)
+        return y.reshape(x_pe.shape)
+
     def __call__(self, x: mx.array, mask=None, cache=None):
         B, S, _ = x.shape
 
@@ -894,8 +958,9 @@ class V4Attention(nn.Module):
         # Apply RoPE only to the last rope_head_dim dims
         q_nope, q_pe = mx.split(q,  [self.nope_head_dim], axis=-1)
         k_nope, k_pe = mx.split(kv, [self.nope_head_dim], axis=-1)
-        q_pe = self.rope(q_pe, offset=offset)
-        k_pe = self.rope(k_pe, offset=offset)
+        attn_rope = self.compress_rope if self.compress_ratio else self.rope
+        q_pe = attn_rope(q_pe, offset=offset)
+        k_pe = attn_rope(k_pe, offset=offset)
         q = mx.concatenate([q_nope, q_pe], axis=-1)
         k = v = mx.concatenate([k_nope, k_pe], axis=-1)
 
@@ -911,10 +976,20 @@ class V4Attention(nn.Module):
             else:
                 pool = None
 
+            # Accumulate the indexer pool in lockstep so top-k block
+            # selection works during decode (S==1), not just prefill.
+            index_pool = None
+            if hasattr(self, "indexer"):
+                if comp_cache is not None:
+                    index_pool = comp_cache.accumulate_index(x, self.indexer.compressor)
+                elif S > 1:
+                    index_pool = self.indexer.compressor(x)
+                    index_pool = index_pool if index_pool.shape[1] > 0 else None
+
             if pool is not None:
                 ckv = pool
                 if hasattr(self, "indexer") and ckv.shape[1] > self.args.index_topk:
-                    topk_idx = self.indexer(x, qr)
+                    topk_idx = self.indexer(x, qr, index_pool)
                     if topk_idx is not None:
                         idx = mx.broadcast_to(
                             topk_idx[:, :, None],
@@ -922,6 +997,14 @@ class V4Attention(nn.Module):
                         )
                         ckv = mx.take_along_axis(ckv, idx, axis=1)
                 compressed_k = ckv[:, None, :, :]
+                # Block i covers tokens [i*ratio, ...); positions are absolute
+                # from sequence start. The pool is never trimmed, so this holds
+                # for cached/continued sequences as well.
+                n_comp = compressed_k.shape[2]
+                comp_pos = mx.arange(n_comp, dtype=mx.float32) * self.compress_ratio
+                ck_nope, ck_pe = mx.split(compressed_k, [self.nope_head_dim], axis=-1)
+                ck_pe = self._rope_at(self.compress_rope, ck_pe, comp_pos)
+                compressed_k = mx.concatenate([ck_nope, ck_pe], axis=-1)
                 compressed_v = compressed_k
 
         # Update KV cache
@@ -934,9 +1017,25 @@ class V4Attention(nn.Module):
             v = mx.concatenate([compressed_v, v], axis=2)
             n_comp = compressed_k.shape[2]
             if mask is not None:
-                comp_shape = list(mask.shape)
-                comp_shape[-1] = n_comp
-                comp_mask = mx.zeros(comp_shape, dtype=mask.dtype)
+                # Compressed pool columns must be ATTENDED (bool True) and CAUSAL:
+                # row j summarizes prefill positions [j*r, (j+1)*r), so a query at
+                # position i attends it only once (j+1)*r-1 <= i. The prior
+                # mx.zeros(dtype=bool) masked the whole pool out (garbage once
+                # S > sliding_window). Decode (S==1) has mask=None and is skipped.
+                # (from machiabeli/mlx-lm-1 PR #6, local-only)
+                S_q = mask.shape[-2]
+                r = self.compress_ratio
+                comp_end = mx.arange(n_comp) * r + (r - 1)
+                comp_mask = mx.arange(S_q)[:, None] >= comp_end[None, :]
+                comp_mask = mx.broadcast_to(
+                    comp_mask, list(mask.shape[:-2]) + [S_q, n_comp]
+                ).astype(mask.dtype)
+                if mask.dtype != mx.bool_:
+                    comp_mask = mx.where(
+                        comp_mask.astype(mx.bool_),
+                        mx.array(0.0, mask.dtype),
+                        mx.array(float("-inf"), mask.dtype),
+                    )
                 mask = mx.concatenate([comp_mask, mask], axis=-1)
 
         out = scaled_dot_product_attention(
@@ -950,7 +1049,7 @@ class V4Attention(nn.Module):
         )
 
         out_nope, out_pe = mx.split(out, [self.nope_head_dim], axis=-1)
-        out_pe = self.rope(out_pe, offset=offset, inverse=True)
+        out_pe = attn_rope(out_pe, offset=offset, inverse=True)
         out = mx.concatenate([out_nope, out_pe], axis=-1)
 
         # Grouped low-rank projection: [B, n_heads, S, head_dim] -> [B, S, n_heads*head_dim]
@@ -990,6 +1089,7 @@ class Indexer(nn.Module):
         self,
         x: mx.array,
         q_intermediate: mx.array,
+        ck: Optional[mx.array] = None,
     ) -> Optional[mx.array]:
         """Score compressed rows and return topk indices.
 
@@ -1003,7 +1103,8 @@ class Indexer(nn.Module):
         """
         B, S, _ = x.shape
 
-        ck = self.compressor(x)
+        if ck is None:
+            ck = self.compressor(x)
         n_compressed = ck.shape[1]
         if n_compressed == 0:
             return None
@@ -1151,6 +1252,7 @@ class DeepseekV4Model(nn.Module, PipelineMixin):
         mask = create_attention_mask(
             h[:, :, 0, :],
             first_cache if first_cache is not None else None,
+            window_size=self.args.sliding_window,
             return_array=True,
         )
 

@@ -1848,6 +1848,102 @@ class TestModels(unittest.TestCase):
         mx.eval(outputs)
         self.assertEqual(outputs.shape, (1, 1, args.vocab_size))
 
+    def test_deepseek_v4_prompt_cache_roundtrip(self):
+        # Regression: saving/loading a compressed-attention prompt cache must
+        # preserve the compressed pool, indexer pool and raw buffers, so that
+        # continued generation from a restored cache matches the live cache.
+        import os
+        import tempfile
+        from mlx_lm.models import deepseek_v4
+        from mlx_lm.models.cache import load_prompt_cache, save_prompt_cache
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4", vocab_size=128, hidden_size=64,
+            num_hidden_layers=4, num_attention_heads=4, q_lora_rank=16,
+            o_lora_rank=8, o_groups=2, head_dim=16, qk_rope_head_dim=4,
+            sliding_window=16, compress_ratios=[0, 0, 4, 0], index_n_heads=4,
+            index_head_dim=8, index_topk=4, moe_intermediate_size=16,
+            n_routed_experts=4, n_shared_experts=1, num_experts_per_tok=2,
+            num_hash_layers=1, hc_mult=2, hc_sinkhorn_iters=2,
+        )
+        model = deepseek_v4.Model(args)
+        ids = (mx.arange(20) % 128).reshape(1, 20)
+        nxt = mx.array([[7]])
+        cache = model.make_cache()
+        mx.eval(model(ids, cache=cache))
+        path = os.path.join(tempfile.mkdtemp(), "c.safetensors")
+        save_prompt_cache(path, cache)
+        live = mx.array(model(nxt, cache=cache))[0, -1]
+        restored = load_prompt_cache(path)
+        rest = mx.array(model(nxt, cache=restored))[0, -1]
+        self.assertTrue(mx.allclose(live, rest, atol=1e-4))
+
+    def test_deepseek_v4_indexer_decode_topk(self):
+        # Regression: the indexer pool must accumulate across decode steps so
+        # top-k block selection works during generation. Previously the indexer
+        # recomputed its compressor on the single decode token, produced zero
+        # rows, and returned None (top-k silently disabled during decode).
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4", hidden_size=64, num_hidden_layers=4,
+            num_attention_heads=8, head_dim=32, qk_rope_head_dim=16,
+            rms_norm_eps=1e-6, index_n_heads=4, index_head_dim=16,
+            index_topk=2, q_lora_rank=16,
+        )
+        indexer = deepseek_v4.Indexer(args, compress_ratio=4)
+        S = 22
+        x = mx.random.normal((1, S, 64))
+        qr = mx.random.normal((1, S, 16))
+
+        ref = indexer.compressor(x)
+        cache = deepseek_v4.CompressedKVCache()
+        for i in range(S):
+            cache.accumulate_index(x[:, i : i + 1], indexer.compressor)
+        self.assertEqual(cache._index_pool.shape, ref.shape)
+        self.assertTrue(mx.allclose(cache._index_pool, ref, atol=1e-4, rtol=1e-4))
+
+        topk = indexer(x[:, -1:], qr[:, -1:], cache._index_pool)
+        self.assertIsNotNone(topk)
+        self.assertEqual(topk.shape, (1, args.index_topk))
+
+    def test_deepseek_v4_compressed_cache_matches_prefill(self):
+        # Regression: the incremental-decode compressed-KV cache must reproduce
+        # the prefill Compressor output bit-for-bit, including the prefill
+        # remainder tokens (S % ratio) and the ratio-4 cross-window overlap.
+        # Guards against the decode/chunk divergence that dropped tokens.
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            head_dim=32,
+            qk_rope_head_dim=16,
+            rms_norm_eps=1e-6,
+        )
+
+        def check(ratio, S, chunks):
+            comp = deepseek_v4.Compressor(args, ratio, head_dim=32)
+            x = mx.random.normal((1, S, 64))
+            ref = comp(x)
+            c1 = deepseek_v4.CompressedKVCache()
+            for i in range(S):
+                c1.accumulate(x[:, i : i + 1], comp)
+            c2 = deepseek_v4.CompressedKVCache()
+            j = 0
+            for cs in chunks:
+                c2.accumulate(x[:, j : j + cs], comp)
+                j += cs
+            for pool in (c1._pool, c2._pool):
+                self.assertEqual(pool.shape, ref.shape)
+                self.assertTrue(mx.allclose(pool, ref, atol=1e-5, rtol=1e-5))
+
+        check(4, 14, [5, 9])
+        check(4, 16, [3, 3, 10])
+        check(2, 15, [7, 8])
+
     def test_deepseek_v4_sanitize_unpacks_fp4_experts(self):
         from mlx_lm.models import deepseek_v4
 
