@@ -861,13 +861,17 @@ class V4Attention(nn.Module):
         self.wo_a = nn.Linear(group_feat, self.n_groups * self.o_lora_rank, bias=False)
         self.wo_b = nn.Linear(self.n_groups * self.o_lora_rank, self.dim, bias=args.attention_bias)
 
-        # RoPE: main Q/K always rotate with rope_theta. Compressed-pool RoPE
-        # (when present) uses compress_rope_theta. Reference DeepSeek-V4
-        # initializes both as separate instances — sharing them ties the main
-        # attention rotation to the wrong base on compressed layers, manifesting
-        # as periodic token drops in CJK (cf. Shinka-Man's report on #1192,
-        # fixed there in @Blaizzy/mlx-lm@b78ccb1).
-        self.rope = DeepseekV4RoPE(self.rope_head_dim, args.rope_theta, args.rope_scaling)
+        # RoPE: two separate instances, selected per layer type in __call__.
+        # Sliding-window ("main") layers use PLAIN RoPE at rope_theta (10000) with
+        # NO YaRN scaling; compressed (CSA/HCA) layers use YaRN RoPE at
+        # compress_rope_theta (160000). This matches the DeepSeek-V4 reference
+        # (HF DeepseekV4Config.__post_init__: main={"rope_type": "default"},
+        # compress={**yarn}) — "pure sliding-window layers use plain RoPE ... YaRN
+        # applies only to compressor layers." Passing rope_scaling to the main rope
+        # wrongly applied factor-16 frequency interpolation on sliding layers.
+        # Separate instances also avoid tying the main rotation to the wrong base
+        # on compressed layers (cf. #1192 CJK token-drop report, @Blaizzy@b78ccb1).
+        self.rope = DeepseekV4RoPE(self.rope_head_dim, args.rope_theta, scaling_config=None)
         self.compress_rope = DeepseekV4RoPE(
             self.rope_head_dim, args.compress_rope_theta, args.rope_scaling,
         )

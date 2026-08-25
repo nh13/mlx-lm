@@ -1613,6 +1613,63 @@ class TestModels(unittest.TestCase):
         ).reshape(1, 2, 4, 8)
         self.assertTrue(mx.allclose(y, expected, rtol=1e-5, atol=1e-5))
 
+    def test_deepseek_v4_sliding_rope_no_yarn(self):
+        # Sliding-window ("main") layers must use PLAIN RoPE (no YaRN); compressed
+        # (CSA/HCA) layers use YaRN. Matches the DeepSeek-V4 reference
+        # (HF DeepseekV4Config: main={"rope_type": "default"}, compress={**yarn}).
+        from mlx_lm.models import deepseek_v4
+        from mlx_lm.models.deepseek_v4 import DeepseekV4RoPE
+
+        scaling = {
+            "type": "yarn",
+            "factor": 16,
+            "original_max_position_embeddings": 65536,
+            "beta_fast": 32,
+            "beta_slow": 1,
+        }
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=32,
+            o_lora_rank=16,
+            o_groups=1,
+            head_dim=32,
+            qk_rope_head_dim=8,
+            sliding_window=16,
+            compress_ratios=[0, 4, 128, 0],
+            index_n_heads=4,
+            index_head_dim=16,
+            index_topk=8,
+            moe_intermediate_size=32,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            rope_theta=10000.0,
+            compress_rope_theta=160000.0,
+            max_position_embeddings=256,
+            rope_scaling=scaling,
+        )
+        sliding = deepseek_v4.V4Attention(args, 0)  # compress_ratio == 0
+        comp = deepseek_v4.V4Attention(args, 1)  # compress_ratio == 4
+
+        d, theta = args.qk_rope_head_dim, args.rope_theta
+        plain = DeepseekV4RoPE(d, theta, None).inv_freq
+        yarn160 = DeepseekV4RoPE(d, args.compress_rope_theta, scaling).inv_freq
+        plain160 = DeepseekV4RoPE(d, args.compress_rope_theta, None).inv_freq
+
+        # Sliding layer: main rope is plain (no YaRN interpolation).
+        self.assertTrue(mx.allclose(sliding.rope.inv_freq, plain))
+        # Compressed layer: compress rope is YaRN, and YaRN actually changed it.
+        self.assertTrue(mx.allclose(comp.compress_rope.inv_freq, yarn160))
+        self.assertFalse(mx.allclose(comp.compress_rope.inv_freq, plain160))
+
     def test_deepseek_v4(self):
         from mlx_lm.models import deepseek_v4
 
