@@ -589,6 +589,18 @@ class CompressedKVCache(KVCache):
     def trim(self, n):
         return self.local.trim(n)
 
+    def spec_snapshot(self):
+        """Snapshot the compressed-pool state for speculative-verify rollback. The pool
+        fields are immutable arrays (+ ints) rebuilt via concat, so this is a cheap
+        reference save; the local sliding KV is trimmed back separately (it is
+        trimmable). Restore with `spec_restore`."""
+        return (self._pool, self._buf, self._buf_count, self._abs_pos,
+                self._index_pool, self._index_buf, self._index_abs_pos)
+
+    def spec_restore(self, snap):
+        (self._pool, self._buf, self._buf_count, self._abs_pos,
+         self._index_pool, self._index_buf, self._index_abs_pos) = snap
+
     @classmethod
     def merge(cls, caches):
         """Merge multiple CompressedKVCaches into a single batched cache."""
@@ -1554,6 +1566,116 @@ class Model(nn.Module):
             tokens.append(int(nxt.item()))
             prev = nxt
         return tokens
+
+    def _dspark_snapshot_target(self, caches: List[Any]):
+        """Snapshot the target caches for spec-verify rollback: each cache's offset
+        plus the compressed-pool state where present (cheap ref save)."""
+        snap = []
+        for c in caches:
+            if isinstance(c, CompressedKVCache):
+                snap.append((c.local.offset, c.spec_snapshot()))
+            else:
+                snap.append((c.offset, None))
+        return snap
+
+    def _dspark_restore_target(self, caches: List[Any], snap) -> None:
+        """Undo a spec-verify forward: trim each local sliding KV back to its
+        pre-verify offset and restore the compressed pool."""
+        for c, (off, pool) in zip(caches, snap):
+            if isinstance(c, CompressedKVCache):
+                c.local.trim(c.local.offset - off)
+                c.spec_restore(pool)
+            else:
+                c.trim(c.offset - off)
+
+    def dspark_generate(
+        self,
+        prompt_ids: List[int],
+        max_tokens: int,
+        *,
+        cap: Optional[int] = None,
+        collapse: str = "mean",
+    ):
+        """Lossless DSpark speculative greedy decode (arXiv:2607.05147).
+
+        CORRECTNESS: lossless in exact arithmetic. The V4 forward is causal (verified:
+        appending tokens does not change earlier-position logits — zero information
+        leak), so within one verify forward each position's argmax is independent of the
+        drafts after it; the committed sequence (accepted greedy-prefix + bonus) is
+        exactly the target's own greedy continuation. On a QUANTIZED checkpoint the
+        output matches plain greedy only up to quantization near-tie flips — plain greedy
+        is itself not reproducible between incremental-cache and full-recompute (a
+        length-dependent rounding effect), so bit-exact identity is not a meaningful gate
+        there.
+
+        PERFORMANCE: this reference implementation runs two target forwards per round
+        (verify, then a clean advance of the accepted tokens) because exact single-forward
+        rollback of the compressed-KV pool is a follow-up. It is therefore not yet faster
+        than plain decode; the structure (draft -> verify -> accept -> commit, with
+        draft-side ctx rollback) is correct and ready for that optimization.
+
+        Returns (token_ids, stats) where stats has `mean_accept_len` and `rounds`.
+        """
+        if not hasattr(self, "mtp"):
+            raise ValueError("checkpoint has no DSpark head (dspark_target_layer_ids unset)")
+        bs = self.args.dspark_block_size
+        cap = bs if cap is None else min(cap, bs)
+        mask_id = self.args.dspark_noise_token_id
+
+        tgt = self.make_cache()
+        ctxc = self.make_dspark_ctx_cache()
+        # Full-prompt prefill (so the first token equals plain greedy); seed the draft
+        # context with the whole prompt tap.
+        logits, tap = self.dspark_tap(mx.array([list(prompt_ids)]), tgt, collapse)
+        self.dspark_update_context(tap, 0, ctxc)
+        pending = int(mx.argmax(logits[0, -1]).item())
+        out = [pending]
+        committed_len = len(prompt_ids)   # positions held by the target cache
+        accept_lens: List[int] = []
+
+        while len(out) < max_tokens:
+            # --- draft a block; the backbone appends the block to the ctx caches, so
+            #     roll that back before it can poison the next round's context ---
+            block = mx.array([[pending] + [mask_id] * (bs - 1)])
+            ctx_off = [c.offset for c in ctxc]
+            base = self.dspark_backbone(block, ctxc)
+            drafted = self.dspark_sample_block(base[0], pending, cap=cap)
+            for c, off in zip(ctxc, ctx_off):
+                c.trim(c.offset - off)
+
+            # --- verify [pending] + drafted against the target (appends to tgt) ---
+            snap = self._dspark_snapshot_target(tgt)
+            vlogits, vtap = self.dspark_tap(mx.array([[pending] + drafted]), tgt, collapse)
+            tt = mx.argmax(vlogits[0], axis=-1)
+            mx.eval(tt)
+            n = 0
+            for i in range(len(drafted)):
+                if drafted[i] == int(tt[i].item()):
+                    n += 1
+                else:
+                    break
+            bonus = int(tt[n].item())
+            committed = drafted[:n] + [bonus]
+            accept_lens.append(len(committed))
+
+            # commit context with the accepted positions [pending]+accepted (verify tap is
+            # causally valid to reuse), then re-advance the target cache cleanly.
+            self.dspark_update_context(vtap[:, : n + 1, :], committed_len, ctxc)
+            self._dspark_restore_target(tgt, snap)
+            self.dspark_tap(mx.array([[pending] + drafted[:n]]), tgt, collapse)
+            committed_len += n + 1
+
+            for t in committed:
+                out.append(t)
+                if len(out) >= max_tokens:
+                    break
+            pending = bonus
+
+        stats = {
+            "mean_accept_len": sum(accept_lens) / len(accept_lens) if accept_lens else 0.0,
+            "rounds": len(accept_lens),
+        }
+        return out[:max_tokens], stats
 
     # ------------------------------------------------------------------- #
     # Weight loading                                                      #
