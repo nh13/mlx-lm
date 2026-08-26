@@ -475,16 +475,65 @@ class DeepseekV4MoE(nn.Module):
         return y
 
 
-@lru_cache(maxsize=16)
-def _compressed_col_mask(S_q: int, n_comp: int, r: int, dtype: mx.Dtype) -> mx.array:
-    """Mask columns for the compressed-KV pool, [S_q, n_comp]. Row j summarizes
-    prefill positions [j*r, (j+1)*r), so query row i attends it iff (j+1)*r-1 <= i.
-    Depends only on (S_q, n_comp, r, dtype) — memoized so a multi-token forward builds
-    just one mask per compress-ratio class (reused across all layers of that class)
-    instead of rebuilding it in every compressed layer. bool dtype -> bool mask;
-    else additive 0/-inf."""
+def _rope_at(rope, x_pe: mx.array, positions: mx.array) -> mx.array:
+    """Interleaved-pair RoPE on x_pe[..., S, dims] at explicit `positions` [S]."""
+    dims = rope.dims
+    theta = positions[:, None] * rope.inv_freq[None, :]
+    cos = mx.cos(theta).astype(x_pe.dtype)
+    sin = mx.sin(theta).astype(x_pe.dtype)
+    shape = (1,) * (x_pe.ndim - 2) + cos.shape
+    cos = cos.reshape(shape)
+    sin = sin.reshape(shape)
+    rot = x_pe[..., :dims].reshape(*x_pe.shape[:-1], dims // 2, 2)
+    x0 = rot[..., 0]
+    x1 = rot[..., 1]
+    y = mx.stack((x0 * cos - x1 * sin, x0 * sin + x1 * cos), axis=-1)
+    return y.reshape(x_pe.shape)
+
+
+def _rope_pool(rope, pool: mx.array, positions: mx.array, rope_head_dim: int) -> mx.array:
+    """RoPE the last `rope_head_dim` dims of compressed pool rows [..., n, head_dim]
+    at absolute `positions` [n]. Rows are roped ONCE at emit time (row j at its true
+    absolute position j*ratio) so a later top-k gather carries each selected row's
+    correct positional signal — matching the HF DeepSeek-V4 reference, which ropes
+    compressed rows at emit and never repositions them. (The old code roped after the
+    gather at arange(n)*ratio, mis-positioning the unordered selected rows.)"""
+    nope = pool.shape[-1] - rope_head_dim
+    p_nope, p_pe = mx.split(pool, [nope], axis=-1)
+    p_pe = _rope_at(rope, p_pe, positions)
+    return mx.concatenate([p_nope, p_pe], axis=-1)
+
+
+@lru_cache(maxsize=32)
+def _compressed_col_mask(
+    S_q: int, offset: int, n_comp: int, r: int, dtype: mx.Dtype
+) -> mx.array:
+    """Contiguous compressed-pool mask columns, [S_q, n_comp]. Block j summarizes
+    raw positions [j*r, (j+1)*r), so a query at absolute position offset+i attends it
+    iff offset+i >= (j+1)*r-1. Memoized (depends only on these scalars) so a
+    multi-token forward builds one mask per (offset, compress-ratio) rather than
+    rebuilding it in every compressed layer. bool dtype -> bool; else additive 0/-inf."""
     comp_end = mx.arange(n_comp) * r + (r - 1)
-    keep = mx.arange(S_q)[:, None] >= comp_end[None, :]        # [S_q, n_comp] bool
+    keep = (offset + mx.arange(S_q))[:, None] >= comp_end[None, :]   # [S_q, n_comp]
+    if dtype == mx.bool_:
+        return keep
+    return mx.where(keep, mx.array(0.0, dtype), mx.array(float("-inf"), dtype))
+
+
+def _compressed_mask(
+    S_q: int, offset: int, n_comp: int, r: int, dtype: mx.Dtype,
+    block_ids: Optional[mx.array],
+) -> mx.array:
+    """Compressed-pool mask columns [S_q, n_comp]. Query row i sits at absolute
+    position offset+i and attends compressed column g (covering raw block b, ending at
+    b*r+r-1) iff offset+i >= b*r+r-1, where b = block_ids[g] for a gathered (top-k)
+    pool or g for a contiguous pool. The contiguous case is memoized; the gathered case
+    is data-dependent (unordered top-k ids) so it is built per call. block_ids is 1-D
+    (batch 1 — the single-sequence generation/DSpark path)."""
+    if block_ids is None:
+        return _compressed_col_mask(S_q, offset, n_comp, r, dtype)
+    comp_end = block_ids.astype(mx.int32) * r + (r - 1)             # [n_comp]
+    keep = (offset + mx.arange(S_q))[:, None] >= comp_end[None, :]  # [S_q, n_comp]
     if dtype == mx.bool_:
         return keep
     return mx.where(keep, mx.array(0.0, dtype), mx.array(float("-inf"), dtype))
@@ -521,6 +570,7 @@ class CompressedKVCache(KVCache):
         self._spec_raw = None
         self._spec_compressor = None
         self._spec_index_compressor = None
+        self._spec_rope = None
 
     @property
     def offset(self):
@@ -642,6 +692,7 @@ class CompressedKVCache(KVCache):
         self._spec_raw = None
         self._spec_compressor = None
         self._spec_index_compressor = None
+        self._spec_rope = None
         self._spec_armed = True
 
     def spec_trim(self, keep: int):
@@ -659,7 +710,7 @@ class CompressedKVCache(KVCache):
         if x is not None and self._spec_compressor is not None:
             xk = x[:, :keep]
             self._pool, self._buf, self._abs_pos = self._accumulate_window(
-                pool0, buf0, abs0, xk, self._spec_compressor)
+                pool0, buf0, abs0, xk, self._spec_compressor, self._spec_rope)
             self._buf_count = 0 if self._buf is None else self._buf.shape[1]
             if self._spec_index_compressor is not None:
                 self._index_pool, self._index_buf, self._index_abs_pos = (
@@ -808,7 +859,7 @@ class CompressedKVCache(KVCache):
         return mx.concatenate([pad(a), pad(b)], axis=0)
 
     @staticmethod
-    def _accumulate_window(pool, buf, abs_pos, x, compressor):
+    def _accumulate_window(pool, buf, abs_pos, x, compressor, rope=None):
         """Emit compressed rows for completed windows; return (pool, buf, abs_pos).
 
         Shared by the main compressed KV pool and the indexer pool. Each row is
@@ -816,6 +867,12 @@ class CompressedKVCache(KVCache):
         single full-sequence forward would see (retaining the previous window
         for ratio-4 overlap), so incremental decode is bit-for-bit consistent
         with prefill, including prefill remainders and chunk boundaries.
+
+        When `rope` is given (main pool only — the index pool stays unroped, since
+        the indexer does not rope its queries), each newly emitted row is RoPE'd at
+        its true absolute position (row j -> j*r) before it enters the pool, so a
+        later top-k gather carries the correct positional signal. Deterministic in
+        the row index, so `spec_trim`'s replay reproduces the pool bit-exactly.
         """
         r = compressor.ratio
         overlap = compressor.overlap
@@ -823,6 +880,7 @@ class CompressedKVCache(KVCache):
         abs_pos += x.shape[1]
         raw_start = abs_pos - buf.shape[1]
         n_rows = 0 if pool is None else pool.shape[1]
+        n_before = n_rows
         while (n_rows + 1) * r <= abs_pos:
             w = n_rows
             need_start = ((w - 1) * r) if (overlap and w > 0) else (w * r)
@@ -832,14 +890,22 @@ class CompressedKVCache(KVCache):
             row = rows[:, -1:]
             pool = row if pool is None else mx.concatenate([pool, row], axis=1)
             n_rows += 1
+        if rope is not None and n_rows > n_before:
+            # RoPE just-emitted rows [n_before, n_rows) at positions [n_before*r, ...).
+            pos = mx.arange(n_before, n_rows, dtype=mx.float32) * r
+            roped = _rope_pool(rope, pool[:, n_before:], pos, compressor.rope_head_dim)
+            pool = roped if n_before == 0 else mx.concatenate([pool[:, :n_before], roped], axis=1)
         keep_abs = max(((n_rows - 1) * r) if overlap else (n_rows * r), 0)
         drop = keep_abs - raw_start
         if drop > 0:
             buf = buf[:, drop:]
         return pool, buf, abs_pos
 
-    def accumulate(self, x: mx.array, compressor: "Compressor") -> Optional[mx.array]:
-        """Main compressed-KV pool: buffer raw tokens, emit rows on boundaries."""
+    def accumulate(
+        self, x: mx.array, compressor: "Compressor", rope=None
+    ) -> Optional[mx.array]:
+        """Main compressed-KV pool: buffer raw tokens, emit rows on boundaries. Pass
+        `rope` (the compress RoPE) to pre-rope emitted rows at their true positions."""
         # getattr guard: caches rebuilt via __new__ (from_state/merge/extract) skip
         # __init__, so the spec fields may be absent; they are only armed by spec_begin.
         if getattr(self, "_spec_armed", False):
@@ -848,8 +914,9 @@ class CompressedKVCache(KVCache):
                 else mx.concatenate([self._spec_raw, x], axis=1)
             )
             self._spec_compressor = compressor
+            self._spec_rope = rope
         self._pool, self._buf, self._abs_pos = self._accumulate_window(
-            self._pool, self._buf, self._abs_pos, x, compressor
+            self._pool, self._buf, self._abs_pos, x, compressor, rope
         )
         self._buf_count = 0 if self._buf is None else self._buf.shape[1]
         return self._pool
@@ -1044,22 +1111,6 @@ class V4Attention(nn.Module):
             out = out + self.wo_a.bias
         return out
 
-    @staticmethod
-    def _rope_at(rope, x_pe, positions):
-        # Interleaved-pair RoPE on x_pe[..., S, dims] at explicit positions[S].
-        dims = rope.dims
-        theta = positions[:, None] * rope.inv_freq[None, :]
-        cos = mx.cos(theta).astype(x_pe.dtype)
-        sin = mx.sin(theta).astype(x_pe.dtype)
-        shape = (1,) * (x_pe.ndim - 2) + cos.shape
-        cos = cos.reshape(shape)
-        sin = sin.reshape(shape)
-        rot = x_pe[..., :dims].reshape(*x_pe.shape[:-1], dims // 2, 2)
-        x0 = rot[..., 0]
-        x1 = rot[..., 1]
-        y = mx.stack((x0 * cos - x1 * sin, x0 * sin + x1 * cos), axis=-1)
-        return y.reshape(x_pe.shape)
-
     def __call__(self, x: mx.array, mask=None, cache=None):
         B, S, _ = x.shape
 
@@ -1084,14 +1135,23 @@ class V4Attention(nn.Module):
         k = v = mx.concatenate([k_nope, k_pe], axis=-1)
 
         # --- Compressed sparse attention ---
+        # Pool rows are RoPE'd at their true absolute positions when emitted (in the
+        # cache) or below (cacheless prefill), so the top-k gather carries each
+        # selected row's correct positional signal — matching the HF reference.
+        rope_head_dim = self.head_dim - self.nope_head_dim
         compressed_k = compressed_v = None
+        gathered_ids = None
         if self.compress_ratio:
             comp_cache = cache if isinstance(cache, CompressedKVCache) else None
             if comp_cache is not None:
-                pool = comp_cache.accumulate(x, self.compressor)
+                pool = comp_cache.accumulate(x, self.compressor, self.compress_rope)
             elif S > 1:
                 pool = self.compressor(x)
-                pool = pool if pool.shape[1] > 0 else None
+                if pool.shape[1] > 0:
+                    pos = mx.arange(pool.shape[1], dtype=mx.float32) * self.compress_ratio
+                    pool = _rope_pool(self.compress_rope, pool, pos, rope_head_dim)
+                else:
+                    pool = None
             else:
                 pool = None
 
@@ -1110,20 +1170,13 @@ class V4Attention(nn.Module):
                 if hasattr(self, "indexer") and ckv.shape[1] > self.args.index_topk:
                     topk_idx = self.indexer(x, qr, index_pool)
                     if topk_idx is not None:
+                        gathered_ids = topk_idx                        # [B, topk]
                         idx = mx.broadcast_to(
                             topk_idx[:, :, None],
                             (B, topk_idx.shape[1], self.head_dim),
                         )
                         ckv = mx.take_along_axis(ckv, idx, axis=1)
-                compressed_k = ckv[:, None, :, :]
-                # Block i covers tokens [i*ratio, ...); positions are absolute
-                # from sequence start. The pool is never trimmed, so this holds
-                # for cached/continued sequences as well.
-                n_comp = compressed_k.shape[2]
-                comp_pos = mx.arange(n_comp, dtype=mx.float32) * self.compress_ratio
-                ck_nope, ck_pe = mx.split(compressed_k, [self.nope_head_dim], axis=-1)
-                ck_pe = self._rope_at(self.compress_rope, ck_pe, comp_pos)
-                compressed_k = mx.concatenate([ck_nope, ck_pe], axis=-1)
+                compressed_k = ckv[:, None, :, :]                      # rows already roped
                 compressed_v = compressed_k
 
         # Update KV cache
@@ -1136,15 +1189,16 @@ class V4Attention(nn.Module):
             v = mx.concatenate([compressed_v, v], axis=2)
             n_comp = compressed_k.shape[2]
             if mask is not None:
-                # Compressed pool columns must be ATTENDED (bool True) and CAUSAL:
-                # row j summarizes prefill positions [j*r, (j+1)*r), so a query at
-                # position i attends it only once (j+1)*r-1 <= i. The prior
-                # mx.zeros(dtype=bool) masked the whole pool out (garbage once
-                # S > sliding_window). Decode (S==1) has mask=None and is skipped.
-                # (from machiabeli/mlx-lm-1 PR #6, local-only)
+                # Compressed pool columns are ATTENDED (bool True) and CAUSAL: query
+                # row i (absolute position offset+i) attends compressed block b iff
+                # offset+i >= b*r+r-1, where b is the true block id (gathered_ids after
+                # top-k, else the contiguous index). Decode (S==1) has mask=None. The
+                # offset term (previously omitted) is required for any forward at
+                # offset>0 past the sliding window — chunked prefill and DSpark verify.
                 S_q = mask.shape[-2]
-                comp_mask = _compressed_col_mask(
-                    S_q, n_comp, self.compress_ratio, mask.dtype
+                block_ids = gathered_ids[0] if gathered_ids is not None else None
+                comp_mask = _compressed_mask(
+                    S_q, offset, n_comp, self.compress_ratio, mask.dtype, block_ids
                 )
                 comp_mask = mx.broadcast_to(
                     comp_mask, list(mask.shape[:-2]) + [S_q, n_comp]
