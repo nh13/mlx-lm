@@ -1582,15 +1582,19 @@ class Model(nn.Module):
             stage.update_ctx(fused, ctx_offset, cache)
 
     def dspark_backbone(
-        self, block_ids: mx.array, ctx_caches: List[Any], mask=None
-    ) -> mx.array:
+        self, block_ids: mx.array, ctx_caches: List[Any], mask=None,
+        return_hidden: bool = False,
+    ):
         """Run the DSpark backbone over a draft block -> base logits [B, blk, V].
 
         `block_ids` [B, blk] = [anchor, noise, ...]. `ctx_caches` must already hold
         the context K=V (via dspark_update_context); each stage's block rope offset
         flows from its cache.offset, so the block sits at absolute [ctx_len, ...] and
         cross-attends [context, block]. mask=None gives the single-block layout
-        (full attention over the whole context + bidirectional block)."""
+        (full attention over the whole context + bidirectional block).
+
+        With `return_hidden`, also returns the last stage's post-norm hidden [B, blk, D]
+        (pre-lm_head) — the confidence head's per-position input."""
         h = self.model.embed_tokens(block_ids)                        # [B, blk, D]
         hc = self.args.hc_mult
         h = mx.contiguous(
@@ -1600,7 +1604,8 @@ class Model(nn.Module):
             h = stage(h, mask, cache, block_ids)                      # cross-attn block forward
         last = self.mtp[-1]
         out = last.norm(last.hc_head(h))                              # collapse streams + norm
-        return self.lm_head(out)                                       # [B, blk, V]
+        logits = self.lm_head(out)                                     # [B, blk, V]
+        return (logits, out) if return_hidden else logits
 
     def dspark_sample_block(
         self, base_logits: mx.array, first_prev: int, cap: Optional[int] = None
@@ -1621,6 +1626,24 @@ class Model(nn.Module):
             tokens.append(int(nxt.item()))
             prev = nxt
         return tokens
+
+    def dspark_confidence(
+        self, hidden: mx.array, first_prev: int, drafted: List[int]
+    ) -> List[float]:
+        """Per-draft-position acceptance probability from the DSpark confidence head
+        (arXiv:2607.05147 §3.2.1). Input mirrors the Markov step's conditioning:
+        concat(last-stage post-norm hidden_i, markov_w1(prev_token_i)) where
+        prev_token_i = [anchor] + drafted[:-1]. Returns sigmoid(logit) per position:
+        the predicted probability that draft token i survives verification."""
+        last = self.mtp[-1]
+        k = len(drafted)
+        prev = mx.array([first_prev] + drafted[:-1])                   # [k]
+        feats = mx.concatenate(
+            [hidden[:k], last.markov_head.prev_embedding(prev)], axis=-1
+        )                                                             # [k, D+rank]
+        conf = mx.sigmoid(last.confidence_head(feats)[:, 0])           # [k]
+        mx.eval(conf)
+        return [float(x) for x in conf.tolist()]
 
     def _dspark_spec_begin(self, caches: List[Any]) -> List[int]:
         """Arm single-forward spec rollback before a verify forward: record each
@@ -1655,6 +1678,7 @@ class Model(nn.Module):
         *,
         cap: Optional[int] = None,
         collapse: str = "mean",
+        confidence_threshold: float = 0.0,
     ):
         """Lossless DSpark speculative greedy decode (arXiv:2607.05147).
 
@@ -1675,7 +1699,17 @@ class Model(nn.Module):
         pass is needed. This also makes the committed cache numerically self-consistent
         with the forward that made the accept decision.
 
-        Returns (token_ids, stats) where stats has `mean_accept_len` and `rounds`.
+        ADAPTIVE VERIFY LENGTH (arXiv:2607.05147 §3.2.1): with
+        `confidence_threshold > 0`, the confidence head trims the draft to the longest
+        prefix whose cumulative survival probability stays >= the threshold (min 1
+        token), shrinking the verify width — the dominant per-round cost — on rounds
+        where the drafter is unsure. This never changes which tokens are COMMITTED
+        (still the verify forward's own argmax), so losslessness is preserved; a good
+        value is ~0.2 (draft ~5 -> ~3, accept-len preserved, ~1.2x throughput on this
+        2.4-bit checkpoint). `confidence_threshold = 0.0` (default) is identical to the
+        loop above.
+
+        Returns (token_ids, stats) with `mean_accept_len`, `mean_draft_len`, `rounds`.
         """
         if not hasattr(self, "mtp"):
             raise ValueError("checkpoint has no DSpark head (dspark_target_layer_ids unset)")
@@ -1693,16 +1727,30 @@ class Model(nn.Module):
         out = [pending]
         committed_len = len(prompt_ids)   # positions held by the target cache
         accept_lens: List[int] = []
+        draft_lens: List[int] = []
 
         while len(out) < max_tokens:
             # --- draft a block; the backbone appends the block to the ctx caches, so
             #     roll that back before it can poison the next round's context ---
             block = mx.array([[pending] + [mask_id] * (bs - 1)])
             ctx_off = [c.offset for c in ctxc]
-            base = self.dspark_backbone(block, ctxc)
+            base, hidden = self.dspark_backbone(block, ctxc, return_hidden=True)
             drafted = self.dspark_sample_block(base[0], pending, cap=cap)
             for c, off in zip(ctxc, ctx_off):
                 c.trim(c.offset - off)
+
+            # --- adaptive verify length: trim the draft where the confidence head's
+            #     cumulative survival probability falls below the threshold (min 1) ---
+            if confidence_threshold > 0.0 and len(drafted) > 1:
+                conf = self.dspark_confidence(hidden[0], pending, drafted)
+                surv, keep = 1.0, 0
+                for i, c in enumerate(conf):
+                    surv *= c
+                    if surv < confidence_threshold:
+                        break
+                    keep = i + 1
+                drafted = drafted[: max(keep, 1)]
+            draft_lens.append(len(drafted))
 
             # --- verify [pending] + drafted against the target (single forward;
             #     arm exact rollback so the accepted prefix is kept in place) ---
@@ -1734,6 +1782,7 @@ class Model(nn.Module):
 
         stats = {
             "mean_accept_len": sum(accept_lens) / len(accept_lens) if accept_lens else 0.0,
+            "mean_draft_len": sum(draft_lens) / len(draft_lens) if draft_lens else 0.0,
             "rounds": len(accept_lens),
         }
         return out[:max_tokens], stats
