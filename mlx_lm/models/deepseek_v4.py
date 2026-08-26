@@ -51,6 +51,10 @@ class ModelArgs(BaseModelArgs):
     index_n_heads: int = 64
     index_head_dim: int = 128
     index_topk: int = 512
+    # Below this many compressed pool rows, skip the top-k selector and attend the
+    # full pool: the indexer is a small net loss under ~30K context (measured), and
+    # full-pool attention there is both faster and dense-quality. Tunable per host.
+    index_gate_rows: int = 8192
     compress_rope_theta: float = 160000.0
 
     # MoE
@@ -571,6 +575,7 @@ class CompressedKVCache(KVCache):
         self._spec_compressor = None
         self._spec_index_compressor = None
         self._spec_rope = None
+        self._spec_index_rope = None
 
     @property
     def offset(self):
@@ -693,6 +698,7 @@ class CompressedKVCache(KVCache):
         self._spec_compressor = None
         self._spec_index_compressor = None
         self._spec_rope = None
+        self._spec_index_rope = None
         self._spec_armed = True
 
     def spec_trim(self, keep: int):
@@ -715,7 +721,8 @@ class CompressedKVCache(KVCache):
             if self._spec_index_compressor is not None:
                 self._index_pool, self._index_buf, self._index_abs_pos = (
                     self._accumulate_window(
-                        ipool0, ibuf0, iabs0, xk, self._spec_index_compressor))
+                        ipool0, ibuf0, iabs0, xk,
+                        self._spec_index_compressor, self._spec_index_rope))
         else:
             # No rows accumulated during verify — restore the pre-verify snapshot.
             self.spec_restore(self._spec_snap)
@@ -921,8 +928,12 @@ class CompressedKVCache(KVCache):
         self._buf_count = 0 if self._buf is None else self._buf.shape[1]
         return self._pool
 
-    def accumulate_index(self, x: mx.array, compressor: "Compressor") -> Optional[mx.array]:
+    def accumulate_index(
+        self, x: mx.array, compressor: "Compressor", rope=None
+    ) -> Optional[mx.array]:
         """Indexer pool: same windowing as accumulate, separate compressor/state.
+        Pass `rope` to pre-rope emitted index rows at their true positions (the
+        aligned indexer scores RoPE'd keys against RoPE'd queries).
 
         Lets the lightweight index compressor accumulate across decode steps so
         top-k block selection works during generation (it previously recomputed
@@ -931,8 +942,9 @@ class CompressedKVCache(KVCache):
         if getattr(self, "_spec_armed", False):
             # Same raw `x` as accumulate(); only the index compressor differs.
             self._spec_index_compressor = compressor
+            self._spec_index_rope = rope
         self._index_pool, self._index_buf, self._index_abs_pos = self._accumulate_window(
-            self._index_pool, self._index_buf, self._index_abs_pos, x, compressor
+            self._index_pool, self._index_buf, self._index_abs_pos, x, compressor, rope
         )
         return self._index_pool
 
@@ -1156,19 +1168,31 @@ class V4Attention(nn.Module):
                 pool = None
 
             # Accumulate the indexer pool in lockstep so top-k block
-            # selection works during decode (S==1), not just prefill.
+            # selection works during decode (S==1), not just prefill. Index rows are
+            # RoPE'd at emit (aligned indexer scores roped keys vs roped queries).
             index_pool = None
             if hasattr(self, "indexer"):
+                irope = self.compress_rope
                 if comp_cache is not None:
-                    index_pool = comp_cache.accumulate_index(x, self.indexer.compressor)
+                    index_pool = comp_cache.accumulate_index(
+                        x, self.indexer.compressor, irope)
                 elif S > 1:
                     index_pool = self.indexer.compressor(x)
-                    index_pool = index_pool if index_pool.shape[1] > 0 else None
+                    if index_pool.shape[1] > 0:
+                        ipos = mx.arange(index_pool.shape[1], dtype=mx.float32) * self.compress_ratio
+                        index_pool = _rope_pool(
+                            irope, index_pool, ipos, self.indexer.compressor.rope_head_dim)
+                    else:
+                        index_pool = None
 
             if pool is not None:
                 ckv = pool
-                if hasattr(self, "indexer") and ckv.shape[1] > self.args.index_topk:
-                    topk_idx = self.indexer(x, qr, index_pool)
+                # Gate: only run the top-k selector once the pool is large enough that
+                # sparse attention pays for it (~index_gate_rows); below that, attend
+                # the full pool — faster AND dense-quality (measured).
+                gate = max(self.args.index_topk, self.args.index_gate_rows)
+                if hasattr(self, "indexer") and ckv.shape[1] > gate:
+                    topk_idx = self.indexer(x, qr, index_pool, offset, self.compress_rope)
                     if topk_idx is not None:
                         gathered_ids = topk_idx                        # [B, topk]
                         idx = mx.broadcast_to(
@@ -1257,36 +1281,47 @@ class Indexer(nn.Module):
         x: mx.array,
         q_intermediate: mx.array,
         ck: Optional[mx.array] = None,
+        offset: int = 0,
+        rope=None,
     ) -> Optional[mx.array]:
-        """Score compressed rows and return topk indices.
+        """Score compressed rows and return topk indices, aligned with the HF
+        DeepSeek-V4 reference: RoPE'd queries (and RoPE'd keys `ck`, roped at emit)
+        with the compress theta, ReLU(q·k) scoring, and raw signed head weights
+        (no sigmoid) scaled by n_heads**-0.5, aggregated in fp32. The unroped/
+        sigmoid form selected position-blind, degraded rows (measured: needle
+        recall 4/5 vs 5/5, answer-token divergence up to ~3 nats at 16K context).
 
         Args:
             x: [B, S, D] hidden state (fed to the lightweight compressor).
             q_intermediate: [B, S, q_lora_rank] post wq_a+q_norm (shared with main attn).
+            ck: pre-computed index pool [B, n, index_head_dim], RoPE'd at emit.
+            offset: absolute position of query row 0 (for query RoPE).
+            rope: the compress RoPE; when None, queries are left unroped.
 
         Returns:
             topk_indices [B, topk] or None when there are too few compressed rows.
-            Indices are shared across heads (head-weighted scores are aggregated).
+            Indices are shared across heads/queries (head-weighted scores aggregated).
         """
         B, S, _ = x.shape
 
         if ck is None:
             ck = self.compressor(x)
+            if rope is not None and ck.shape[1] > 0:
+                pos = mx.arange(ck.shape[1], dtype=mx.float32) * self.compressor.ratio
+                ck = _rope_pool(rope, ck, pos, self.compressor.rope_head_dim)
         n_compressed = ck.shape[1]
         if n_compressed == 0:
             return None
 
         q = self.wq_b(q_intermediate)
-        q = q.reshape(B, S, self.n_heads, self.head_dim)
-        q = q.transpose(0, 2, 1, 3)
+        q = q.reshape(B, S, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        if rope is not None:
+            q_pos = mx.arange(offset, offset + S, dtype=mx.float32)
+            q = _rope_pool(rope, q, q_pos, rope.dims)
 
-        scores = (q @ ck[:, None].transpose(0, 1, 3, 2)) * self.scale
-
-        hw = mx.sigmoid(self.weights_proj(x))
-        hw = hw.transpose(0, 2, 1)[..., None]
-        scores = scores * hw
-
-        agg = scores.sum(axis=2).mean(axis=1)
+        scores = mx.maximum(q @ ck[:, None].transpose(0, 1, 3, 2), 0.0) * self.scale
+        w = (self.weights_proj(x) * (self.n_heads ** -0.5)).transpose(0, 2, 1)[..., None]
+        agg = (scores.astype(mx.float32) * w).sum(axis=1).sum(axis=1)   # [B, n_comp]
 
         topk = min(self.index_topk, n_compressed)
         return mx.argpartition(-agg, kth=topk - 1, axis=-1)[:, :topk]
