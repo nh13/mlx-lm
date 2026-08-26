@@ -1627,43 +1627,44 @@ class Model(nn.Module):
         logits = self.lm_head(out)                                     # [B, blk, V]
         return (logits, out) if return_hidden else logits
 
-    def dspark_sample_block(
-        self, base_logits: mx.array, first_prev: int, cap: Optional[int] = None
+    def _dspark_draft(
+        self, base_logits: mx.array, hidden: mx.array, first_prev: int,
+        cap: Optional[int], threshold: float,
     ) -> List[int]:
-        """Greedy draft with sequential VanillaMarkov correction (arXiv:2607.05147).
+        """Draft a block: greedy sampling with sequential VanillaMarkov correction
+        (arXiv:2607.05147) plus optional confidence-based trim (§3.2.1), built as one
+        graph and read back with a SINGLE device sync.
 
         `base_logits` [blk, V] are the backbone's parallel per-position logits
-        (single batch, logits_start=0: position i predicts draft token i). The Markov
-        head conditions each position on the PREVIOUS sampled token, so the block is
-        sampled sequentially. Returns the drafted token ids."""
-        markov = self.mtp[-1].markov_head
+        (logits_start=0: position i predicts draft token i); the Markov head conditions
+        each position on the previously sampled token, so the block is sampled
+        sequentially. With `threshold > 0`, the confidence head (input:
+        concat(post-norm hidden_i, markov_w1(prev_token_i))) trims the draft to the
+        longest prefix whose cumulative survival probability stays >= threshold (min 1).
+        Fusing the ~gamma+1 per-token syncs into one matters because the loop is
+        host-sync-bound, not FLOP-bound, at batch=1. Returns the drafted token ids."""
+        last = self.mtp[-1]
+        markov = last.markov_head
         k = base_logits.shape[0] if cap is None else min(cap, base_logits.shape[0])
-        tokens: List[int] = []
         prev = mx.array([first_prev])
-        for i in range(k):
+        toks = []
+        for i in range(k):                                   # sequential Markov graph
             step = base_logits[i] + markov.logit_bias(prev)[0]
             nxt = mx.argmax(step, axis=-1, keepdims=True)
-            tokens.append(int(nxt.item()))
+            toks.append(nxt)
             prev = nxt
-        return tokens
-
-    def dspark_confidence(
-        self, hidden: mx.array, first_prev: int, drafted: List[int]
-    ) -> List[float]:
-        """Per-draft-position acceptance probability from the DSpark confidence head
-        (arXiv:2607.05147 §3.2.1). Input mirrors the Markov step's conditioning:
-        concat(last-stage post-norm hidden_i, markov_w1(prev_token_i)) where
-        prev_token_i = [anchor] + drafted[:-1]. Returns sigmoid(logit) per position:
-        the predicted probability that draft token i survives verification."""
-        last = self.mtp[-1]
-        k = len(drafted)
-        prev = mx.array([first_prev] + drafted[:-1])                   # [k]
-        feats = mx.concatenate(
-            [hidden[:k], last.markov_head.prev_embedding(prev)], axis=-1
-        )                                                             # [k, D+rank]
-        conf = mx.sigmoid(last.confidence_head(feats)[:, 0])           # [k]
-        mx.eval(conf)
-        return [float(x) for x in conf.tolist()]
+        d = mx.concatenate(toks)                             # [k]
+        if threshold > 0.0 and k > 1:
+            prev_ids = mx.concatenate([mx.array([first_prev]), d[:-1]])       # [k]
+            feats = mx.concatenate(
+                [hidden[:k], markov.prev_embedding(prev_ids)], axis=-1
+            )
+            surv = mx.cumprod(mx.sigmoid(last.confidence_head(feats)[:, 0]))  # [k]
+            keep = mx.maximum(mx.sum((surv >= threshold).astype(mx.int32)), 1)
+            mx.eval(d, keep)                                 # one sync
+            return [int(x) for x in d[: int(keep.item())].tolist()]
+        mx.eval(d)                                           # one sync
+        return [int(x) for x in d.tolist()]
 
     def _dspark_spec_begin(self, caches: List[Any]) -> List[int]:
         """Arm single-forward spec rollback before a verify forward: record each
@@ -1755,21 +1756,11 @@ class Model(nn.Module):
             block = mx.array([[pending] + [mask_id] * (bs - 1)])
             ctx_off = [c.offset for c in ctxc]
             base, hidden = self.dspark_backbone(block, ctxc, return_hidden=True)
-            drafted = self.dspark_sample_block(base[0], pending, cap=cap)
+            drafted = self._dspark_draft(
+                base[0], hidden[0], pending, cap, confidence_threshold
+            )
             for c, off in zip(ctxc, ctx_off):
                 c.trim(c.offset - off)
-
-            # --- adaptive verify length: trim the draft where the confidence head's
-            #     cumulative survival probability falls below the threshold (min 1) ---
-            if confidence_threshold > 0.0 and len(drafted) > 1:
-                conf = self.dspark_confidence(hidden[0], pending, drafted)
-                surv, keep = 1.0, 0
-                for i, c in enumerate(conf):
-                    surv *= c
-                    if surv < confidence_threshold:
-                        break
-                    keep = i + 1
-                drafted = drafted[: max(keep, 1)]
             draft_lens.append(len(drafted))
 
             # --- verify [pending] + drafted against the target (single forward;
@@ -1777,13 +1768,9 @@ class Model(nn.Module):
             offsets = self._dspark_spec_begin(tgt)
             vlogits, vtap = self.dspark_tap(mx.array([[pending] + drafted]), tgt, collapse)
             tt = mx.argmax(vlogits[0], axis=-1)
-            mx.eval(tt)
-            n = 0
-            for i in range(len(drafted)):
-                if drafted[i] == int(tt[i].item()):
-                    n += 1
-                else:
-                    break
+            # vectorized accept: length of the leading run of matches, one sync (forces tt)
+            matches = (mx.array(drafted) == tt[: len(drafted)]).astype(mx.int32)
+            n = int(mx.sum(mx.cumprod(matches)).item())
             bonus = int(tt[n].item())
             committed = drafted[:n] + [bonus]
             accept_lens.append(len(committed))
