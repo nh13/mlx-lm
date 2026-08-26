@@ -1286,14 +1286,29 @@ class DSparkStage(DeepseekV4Block):
                 args.hidden_size, args.dspark_markov_rank
             )
 
-    def __call__(self, *args, **kwargs):
-        # The block body forward is inherited (DeepseekV4Block.__call__), but the
-        # DSpark entry-fusion, block-draft, and draft->verify loop are Phase 3-4.
-        # Phase 1-2 only establishes the module tree so the checkpoint's 147 mtp.*
-        # tensors load losslessly (validated by strict load + greedy byte-identity).
-        raise NotImplementedError(
-            "DSparkStage.__call__ is not yet implemented (Phase 3: block draft)."
-        )
+    # NOTE: __call__ is inherited from DeepseekV4Block — the stage's block-body
+    # forward (mHC-wrapped MLA + MoE) IS a DSpark backbone stage. Cross-attention
+    # over [context, block] falls out of the inherited self-attention once the
+    # stage's KV cache is pre-filled with the context K=V by `update_ctx` below.
+
+    def update_ctx(self, fused: mx.array, ctx_offset: int, cache: Any) -> None:
+        """Pre-fill this stage's KV cache with the DSpark context K=V.
+
+        The context is the shared fused target signal main_norm(main_proj(tap_cat))
+        (computed once on the first stage), projected here through THIS stage's own
+        wkv/kv_norm/rope — mirroring the K=V path of V4Attention exactly. After this,
+        the inherited block forward's self.attn(block, cache=cache) appends the block
+        K=V and attends over [context, block], i.e. cross-attention, with rope offsets
+        flowing from cache.offset. `fused`: [B, L_ctx, D]; roped at absolute ctx_offset.
+        """
+        a = self.attn
+        B, L, _ = fused.shape
+        kv = a.kv_norm(a.wkv(fused)).reshape(B, 1, L, a.head_dim)
+        k_nope, k_pe = mx.split(kv, [a.nope_head_dim], axis=-1)
+        # Stages are plain sliding-window (compress_ratio 0) -> plain main rope.
+        k_pe = a.rope(k_pe, offset=ctx_offset)
+        k = mx.concatenate([k_nope, k_pe], axis=-1)
+        cache.update_and_fetch(k, k)  # K==V; advances cache.offset by L
 
 
 # --------------------------------------------------------------------------- #
@@ -1317,7 +1332,26 @@ class DeepseekV4Model(nn.Module, PipelineMixin):
             args.hidden_size, args.hc_mult, args.rms_norm_eps, args.hc_eps
         )
 
-    def __call__(self, inputs: mx.array, cache=None, return_raw_hidden: bool = False):
+    def _collapse(self, h: mx.array, mode: str) -> mx.array:
+        """Collapse an mHC stream stack [B,S,hc,D] -> [B,S,D] for a DSpark tap.
+        The exact reduction the DSpark head was trained against is not specified in
+        any public reference, so it is selectable and resolved empirically."""
+        if mode == "hc_head":
+            return self.hc_head(h)
+        if mode == "stream0":
+            return h[:, :, 0, :]
+        if mode == "mean":
+            return h.mean(axis=2)
+        raise ValueError(f"unknown tap collapse mode: {mode}")
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache=None,
+        return_raw_hidden: bool = False,
+        capture_layer_ids: Optional[List[int]] = None,
+        capture_collapse: str = "hc_head",
+    ):
         h = self.embed_tokens(inputs)                        # [B, S, D]
         # Expand to hc_mult parallel copies
         h = mx.broadcast_to(h[:, :, None, :], (h.shape[0], h.shape[1], self.args.hc_mult, h.shape[2]))
@@ -1344,8 +1378,13 @@ class DeepseekV4Model(nn.Module, PipelineMixin):
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
+        tapset = set(capture_layer_ids) if capture_layer_ids is not None else None
+        captured = [] if tapset is not None else None
         for i in range(self.num_layers):
-            h = self.layers[self.start_idx + i](h, mask, cache[i], inputs)
+            layer_idx = self.start_idx + i
+            h = self.layers[layer_idx](h, mask, cache[i], inputs)
+            if tapset is not None and layer_idx in tapset:
+                captured.append(self._collapse(h, capture_collapse))
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
@@ -1360,6 +1399,9 @@ class DeepseekV4Model(nn.Module, PipelineMixin):
 
         # Reduce [B,S,hc,D] -> [B,S,D] then RMSNorm
         out = self.norm(self.hc_head(h))
+        if captured is not None:
+            # DSpark tap: concat the collapsed residual streams at the tapped layers.
+            return out, mx.concatenate(captured, axis=-1)   # [B, S, n_tap * D]
         if return_raw_hidden:
             return out, h
         return out
@@ -1426,14 +1468,92 @@ class Model(nn.Module):
         return caches
 
     def mtp_forward(self, *args, **kwargs):
-        # The DSpark block-draft forward and draft->verify speculative loop are
-        # Phase 3-4. The old next-1-token forward here was DeepSeek-V3-shaped and
-        # incompatible with the DSpark head, so it has been removed. The default
-        # (non-MTP) generate path is unaffected.
+        # Legacy next-1-token API (generate.py --mtp path). The V3-shaped forward was
+        # removed; DSpark decoding uses the dspark_* methods + a draft->verify loop
+        # (Phase 4). The default (non-MTP) generate path is unaffected.
         raise NotImplementedError(
-            "DSpark MTP forward is not yet implemented (Phase 3: block draft; "
-            "Phase 4: draft->verify loop). The module tree loads; decoding does not."
+            "Legacy mtp_forward is not supported for the DSpark head; use the "
+            "dspark_* methods with a draft->verify loop (Phase 4)."
         )
+
+    # ------------------------------------------------------------------- #
+    # DSpark speculative-decoding head (arXiv:2607.05147)                  #
+    # ------------------------------------------------------------------- #
+
+    def make_dspark_ctx_cache(self) -> Optional[List[Any]]:
+        """One sliding-window KV cache per DSpark stage, holding that stage's
+        projected context K=V (pre-filled by dspark_update_context)."""
+        if not hasattr(self, "mtp"):
+            return None
+        return [RotatingKVCache(max_size=self.args.sliding_window) for _ in self.mtp]
+
+    def dspark_tap(self, inputs: mx.array, cache=None, collapse: str = "hc_head"):
+        """Target forward that also returns the DSpark context tap:
+        (logits [B,S,V], tap_cat [B,S,n_tap*D]) where tap_cat concatenates the
+        collapsed residual streams at `dspark_target_layer_ids`."""
+        out, tap_cat = self.model(
+            inputs, cache,
+            capture_layer_ids=self.args.dspark_target_layer_ids,
+            capture_collapse=collapse,
+        )
+        return self.lm_head(out), tap_cat
+
+    def dspark_fuse(self, tap_cat: mx.array) -> mx.array:
+        """Fuse the tapped target context once: main_norm(main_proj(tap_cat)) -> [B,L,D].
+        main_proj/main_norm live only on the first stage but the fused signal feeds
+        every stage's context projection (per-stage wkv)."""
+        s0 = self.mtp[0]
+        return s0.main_norm(s0.main_proj(tap_cat))
+
+    def dspark_update_context(
+        self, tap_cat: mx.array, ctx_offset: int, ctx_caches: List[Any]
+    ) -> None:
+        """Append the fused context of `tap_cat`'s positions to every stage's KV
+        cache, roped at absolute `ctx_offset`."""
+        fused = self.dspark_fuse(tap_cat)
+        for stage, cache in zip(self.mtp, ctx_caches):
+            stage.update_ctx(fused, ctx_offset, cache)
+
+    def dspark_backbone(
+        self, block_ids: mx.array, ctx_caches: List[Any], mask=None
+    ) -> mx.array:
+        """Run the DSpark backbone over a draft block -> base logits [B, blk, V].
+
+        `block_ids` [B, blk] = [anchor, noise, ...]. `ctx_caches` must already hold
+        the context K=V (via dspark_update_context); each stage's block rope offset
+        flows from its cache.offset, so the block sits at absolute [ctx_len, ...] and
+        cross-attends [context, block]. mask=None gives the single-block layout
+        (full attention over the whole context + bidirectional block)."""
+        h = self.model.embed_tokens(block_ids)                        # [B, blk, D]
+        hc = self.args.hc_mult
+        h = mx.contiguous(
+            mx.broadcast_to(h[:, :, None, :], (h.shape[0], h.shape[1], hc, h.shape[2]))
+        )
+        for stage, cache in zip(self.mtp, ctx_caches):
+            h = stage(h, mask, cache, block_ids)                      # cross-attn block forward
+        last = self.mtp[-1]
+        out = last.norm(last.hc_head(h))                              # collapse streams + norm
+        return self.lm_head(out)                                       # [B, blk, V]
+
+    def dspark_sample_block(
+        self, base_logits: mx.array, first_prev: int, cap: Optional[int] = None
+    ) -> List[int]:
+        """Greedy draft with sequential VanillaMarkov correction (arXiv:2607.05147).
+
+        `base_logits` [blk, V] are the backbone's parallel per-position logits
+        (single batch, logits_start=0: position i predicts draft token i). The Markov
+        head conditions each position on the PREVIOUS sampled token, so the block is
+        sampled sequentially. Returns the drafted token ids."""
+        markov = self.mtp[-1].markov_head
+        k = base_logits.shape[0] if cap is None else min(cap, base_logits.shape[0])
+        tokens: List[int] = []
+        prev = mx.array([first_prev])
+        for i in range(k):
+            step = base_logits[i] + markov.logit_bias(prev)[0]
+            nxt = mx.argmax(step, axis=-1, keepdims=True)
+            tokens.append(int(nxt.item()))
+            prev = nxt
+        return tokens
 
     # ------------------------------------------------------------------- #
     # Weight loading                                                      #
