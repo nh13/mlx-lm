@@ -69,8 +69,24 @@ class ModelArgs(BaseModelArgs):
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
 
-    # MTP (multi-token prediction) — present in checkpoint but unused at inference
+    # MTP (multi-token prediction). `num_nextn_predict_layers` in the base config
+    # is a DeepSeek-V3-loader TRAP: it is set to 1 in V4-Flash checkpoints to stop
+    # V3-shaped loaders from building 3 heads, and is NOT the DSpark backbone depth.
     num_nextn_predict_layers: int = 1
+
+    # DSpark speculative-decoding head (arXiv:2607.05147). Present only in
+    # MTP-preserving checkpoints (e.g. mlx-community DeepSeek-V4-Flash-*-mtp). The
+    # head is a `dspark_num_layers`-stage sliding-window V4 backbone that drafts a
+    # block of `dspark_block_size` future tokens per step from the residual streams
+    # tapped at `dspark_target_layer_ids`, corrected by a VanillaMarkov head. The
+    # stage count is an architectural constant of the DSpark-5 variant (not otherwise
+    # derivable from the base config). When `dspark_target_layer_ids` is None, no
+    # DSpark head is built.
+    dspark_target_layer_ids: Optional[List[int]] = None
+    dspark_block_size: int = 5
+    dspark_markov_rank: int = 256
+    dspark_noise_token_id: int = 128799
+    dspark_num_layers: int = 3
 
     # RoPE / YaRN
     max_position_embeddings: int = 1048576
@@ -91,9 +107,9 @@ class ModelArgs(BaseModelArgs):
                 + [4 if i % 2 else 128 for i in range(max(n - 2, 0))]
                 + ([0] if n >= 2 else [])
             )
-        total_layers = self.num_hidden_layers + self.num_nextn_predict_layers
+        total_layers = self.num_hidden_layers + self.n_mtp_stages
         self.compress_ratios = list(self.compress_ratios[:total_layers])
-        # MTP layers default to compress_ratio=0 (no compression)
+        # MTP stages default to compress_ratio=0 (plain sliding-window MLA)
         while len(self.compress_ratios) < total_layers:
             self.compress_ratios.append(0)
         if len(self.compress_ratios) < self.num_hidden_layers:
@@ -104,6 +120,12 @@ class ModelArgs(BaseModelArgs):
         bad = [r for r in self.compress_ratios if r not in (0, 4, 128)]
         if bad:
             raise ValueError(f"Unsupported DeepSeek-V4 compress ratios: {bad}")
+
+    @property
+    def n_mtp_stages(self) -> int:
+        """Number of DSpark MTP head stages to build (0 when the checkpoint has no
+        DSpark head — i.e. `dspark_target_layer_ids` is unset)."""
+        return self.dspark_num_layers if self.dspark_target_layer_ids else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -1178,43 +1200,100 @@ class DeepseekV4Block(nn.Module):
 # MTP Block (next-N-token prediction head, from Blaizzy/mlx-lm PR #15)        #
 # --------------------------------------------------------------------------- #
 
-class MTPBlock(nn.Module):
-    """Next-N-token prediction head. Each MTP block predicts one extra future
-    token by re-mixing the previous hidden state with the embedded "next" token,
-    then running it through a copy of the V4 transformer block + hc_head.
+class VanillaMarkov(nn.Module):
+    """DSpark Markov head (arXiv:2607.05147, VanillaMarkov variant).
 
-    Adapted from Blaizzy/mlx-lm PR #15. HyperHead signature matches our fork
-    (hidden_size, hc_mult, rms_norm_eps, hc_eps) instead of PR's HyperHead(config).
+    Produces a per-position logit *bias* from the previously sampled token,
+    correcting the parallel backbone's suffix decay. The bias is
+    `markov_w2(markov_w1(prev_token))`: an embedding lookup into a `markov_rank`
+    space followed by a linear projection back to vocab space. Memoryless — it
+    conditions only on the immediately preceding token. V4-Flash uses the plain
+    (Vanilla) variant: only `markov_w1`/`markov_w2`, no gating/RNN state.
     """
 
-    def __init__(self, args: ModelArgs, layer_idx: int):
+    def __init__(self, vocab_size: int, markov_rank: int):
         super().__init__()
-        dim = args.hidden_size
-        self.block = DeepseekV4Block(args, layer_idx)
-        self.e_proj = nn.Linear(dim, dim, bias=False)
-        self.h_proj = nn.Linear(dim, dim, bias=False)
-        self.enorm = nn.RMSNorm(dim, eps=args.rms_norm_eps)
-        self.hnorm = nn.RMSNorm(dim, eps=args.rms_norm_eps)
-        self.norm = nn.RMSNorm(dim, eps=args.rms_norm_eps)
-        self.hc_head = HyperHead(
-            args.hidden_size, args.hc_mult, args.rms_norm_eps, args.hc_eps
-        )
+        self.markov_w1 = nn.Embedding(vocab_size, markov_rank)
+        self.markov_w2 = nn.Linear(markov_rank, vocab_size, bias=False)
 
-    def __call__(
-        self,
-        h: mx.array,
-        embed_tokens: nn.Embedding,
-        input_ids: mx.array,
-        mask: Optional[mx.array],
-        cache: Optional[Any],
-    ) -> mx.array:
-        e = embed_tokens(input_ids)
-        e = self.enorm(e)
-        h_norm = self.hnorm(h)
-        x = self.e_proj(e)[:, :, None, :] + self.h_proj(h_norm)
-        x = mx.contiguous(x)
-        x = self.block(x, mask, cache, input_ids)
-        return x
+    def prev_embedding(self, prev_token: mx.array) -> mx.array:
+        """Rank-space embedding of the previous token (also consumed by the
+        confidence head). `prev_token`: integer array [...]."""
+        return self.markov_w1(prev_token)
+
+    def logit_bias(self, prev_token: mx.array) -> mx.array:
+        """Logit bias to add to the backbone logits at the current block position."""
+        return self.markov_w2(self.markov_w1(prev_token))
+
+
+class DSparkConfidenceHead(nn.Module):
+    """DSpark confidence head: predicts per-position acceptance (survival) from the
+    stage hidden state concatenated with the Markov rank-space embedding of the
+    previous token (`hidden_size + markov_rank` -> 1). Drives *optional* adaptive
+    block length; unused for the fixed-gamma baseline (Phase 5).
+    """
+
+    def __init__(self, hidden_size: int, markov_rank: int):
+        super().__init__()
+        self.proj = nn.Linear(hidden_size + markov_rank, 1, bias=False)
+
+    def __call__(self, features: mx.array) -> mx.array:
+        return self.proj(features)
+
+
+class DSparkStage(DeepseekV4Block):
+    """One stage of the DSpark MTP backbone (arXiv:2607.05147).
+
+    Each stage IS a full V4 transformer block (MLA with num_kv_heads=1, mHC-wrapped
+    attention + MoE) forced to plain sliding-window attention: the stages carry no
+    compressor/indexer tensors, and their `layer_idx` (>= num_hash_layers) selects
+    bias-corrected softmax routing rather than hash routing. Subclassing
+    DeepseekV4Block places the block submodules at FLAT paths (`mtp.<s>.attn`,
+    `mtp.<s>.hc_attn`, `mtp.<s>.ffn`, ...) — matching the checkpoint's tensor names
+    AND its per-path quantization map (e.g. `mtp.0.attn.wq_a` @ 6-bit); nesting them
+    under a `.block.` submodule would miss those per-path bits at load.
+
+    Stage-specific head tensors are asymmetric across the stages:
+      - first stage (mtp.0): `main_proj` (concat of the tapped residual streams ->
+        hidden) + `main_norm` — the entry/fusion of the target model's context.
+      - last stage (mtp.N-1): `hc_head` (mHC stream collapse) + `norm`, plus the
+        draft heads `markov_head` (VanillaMarkov) and `confidence_head`.
+    """
+
+    def __init__(self, args: ModelArgs, stage_idx: int):
+        # layer_idx = num_hidden_layers + stage_idx lands past `num_hash_layers`
+        # (softmax routing) on a compress_ratio=0 slot (plain sliding-window MLA) —
+        # matching the checkpoint's mtp stages.
+        super().__init__(args, args.num_hidden_layers + stage_idx)
+        self.stage_idx = stage_idx
+        self.is_first = stage_idx == 0
+        self.is_last = stage_idx == args.n_mtp_stages - 1
+
+        if self.is_first:
+            n_tap = len(args.dspark_target_layer_ids)
+            self.main_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+            self.main_proj = nn.Linear(
+                n_tap * args.hidden_size, args.hidden_size, bias=False
+            )
+
+        if self.is_last:
+            self.hc_head = HyperHead(
+                args.hidden_size, args.hc_mult, args.rms_norm_eps, args.hc_eps
+            )
+            self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+            self.markov_head = VanillaMarkov(args.vocab_size, args.dspark_markov_rank)
+            self.confidence_head = DSparkConfidenceHead(
+                args.hidden_size, args.dspark_markov_rank
+            )
+
+    def __call__(self, *args, **kwargs):
+        # The block body forward is inherited (DeepseekV4Block.__call__), but the
+        # DSpark entry-fusion, block-draft, and draft->verify loop are Phase 3-4.
+        # Phase 1-2 only establishes the module tree so the checkpoint's 147 mtp.*
+        # tensors load losslessly (validated by strict load + greedy byte-identity).
+        raise NotImplementedError(
+            "DSparkStage.__call__ is not yet implemented (Phase 3: block draft)."
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1293,12 +1372,10 @@ class Model(nn.Module):
         self.model_type = args.model_type
         self.model = DeepseekV4Model(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-        if getattr(args, "num_nextn_predict_layers", 0) > 0:
-            n = args.num_hidden_layers
-            self.mtp = [
-                MTPBlock(args, n + i)
-                for i in range(args.num_nextn_predict_layers)
-            ]
+        # DSpark MTP head (built only for MTP-preserving checkpoints). Gated on the
+        # DSpark tap config, NOT `num_nextn_predict_layers` (a V3-loader trap).
+        if args.n_mtp_stages > 0:
+            self.mtp = [DSparkStage(args, i) for i in range(args.n_mtp_stages)]
 
     def __call__(
         self,
@@ -1341,43 +1418,22 @@ class Model(nn.Module):
             return None
         caches = []
         for mtp_block in self.mtp:
-            attn = mtp_block.block.attn
+            attn = mtp_block.attn
             if attn.compress_ratio:
                 caches.append(CompressedKVCache(max_size=self.args.sliding_window))
             else:
                 caches.append(RotatingKVCache(max_size=self.args.sliding_window))
         return caches
 
-    def mtp_forward(
-        self,
-        h: mx.array,
-        input_ids: mx.array,
-        cache: Optional[List[Any]] = None,
-    ) -> mx.array:
-        if cache is None:
-            cache = [None] * len(self.mtp)
-
-        first_cache = cache[0]
-        mask_cache = (
-            first_cache.local
-            if isinstance(first_cache, CompressedKVCache)
-            else first_cache
+    def mtp_forward(self, *args, **kwargs):
+        # The DSpark block-draft forward and draft->verify speculative loop are
+        # Phase 3-4. The old next-1-token forward here was DeepSeek-V3-shaped and
+        # incompatible with the DSpark head, so it has been removed. The default
+        # (non-MTP) generate path is unaffected.
+        raise NotImplementedError(
+            "DSpark MTP forward is not yet implemented (Phase 3: block draft; "
+            "Phase 4: draft->verify loop). The module tree loads; decoding does not."
         )
-        mask = create_attention_mask(
-            h[:, :, 0, :] if h.ndim == 4 else h,
-            mask_cache,
-            window_size=self.args.sliding_window,
-            return_array=True,
-        )
-
-        for mtp_block, layer_cache in zip(self.mtp, cache):
-            h = mtp_block(
-                h, self.model.embed_tokens, input_ids, mask, layer_cache
-            )
-
-        out = mtp_block.hc_head(h)
-        out = mtp_block.norm(out)
-        return self.lm_head(out)
 
     # ------------------------------------------------------------------- #
     # Weight loading                                                      #
@@ -1400,7 +1456,10 @@ class Model(nn.Module):
             layers.N.{attn_norm,ffn_norm}.weight
             layers.N.hc_{attn,ffn}_{fn,base,scale}
             embed.weight, head.weight, hc_head_{fn,base,scale}
-            mtp.0.* (dropped)
+            mtp.<s>.{attn,ffn,attn_norm,ffn_norm,attn_hc,ffn_hc}.*  (DSpark stages,
+              flat; kept iff self.mtp exists), plus stage heads
+              mtp.0.{main_proj,main_norm}, mtp.N.{hc_head,norm,markov_head,
+              confidence_head}. Dropped when the model has no DSpark head.
 
         MLX-quantized naming (community 8-bit):
             embed.{weight,biases,scales}, head.{weight,biases,scales}
@@ -1523,27 +1582,17 @@ class Model(nn.Module):
         #    shared_experts.w{1,2,3} -> shared_experts.{gate,down,up}_proj
         new = {}
         w_remap = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
-        mtp_block_subs = (
-            "attn.", "ffn.", "attn_norm.", "ffn_norm.",
-            "hc_attn_", "hc_ffn_",
-        )
+        # DSpark mtp stages are FLAT DeepseekV4Blocks (DSparkStage subclasses the
+        # block), so `mtp.<s>.attn/ffn/attn_norm/...` map 1:1 to module paths — the
+        # same generic renames below (attn_hc->hc_attn, gate.bias->e_score_correction_bias,
+        # shared_experts.w{1,2,3}->{gate,down,up}_proj) apply to mtp keys unchanged.
+        # Stage-head tensors (main_proj/main_norm, hc_head, markov_head,
+        # confidence_head, norm) already carry their final names and pass through.
         for k, v in weights.items():
             nk = k
-            # Add model. prefix for main-model layers
+            # Add model. prefix for main-model layers (mtp.* keeps its own prefix)
             if nk.startswith("layers."):
                 nk = "model." + nk
-
-            # MTP block: nest block-internal weights under .block.
-            if nk.startswith("mtp."):
-                parts = nk.split(".", 2)  # ["mtp", "0", "rest"]
-                if len(parts) == 3:
-                    rest = parts[2]
-                    if any(rest.startswith(s) for s in mtp_block_subs):
-                        nk = f"mtp.{parts[1]}.block.{rest}"
-                    # HC head weights for MTP block
-                    for param in ("fn", "base", "scale"):
-                        if rest == f"hc_head_{param}":
-                            nk = f"mtp.{parts[1]}.hc_head.{param}"
 
             # gate.bias -> gate.e_score_correction_bias
             nk = nk.replace(".ffn.gate.bias", ".ffn.gate.e_score_correction_bias")
@@ -1600,10 +1649,23 @@ class Model(nn.Module):
                     if parts:
                         weights[f"{prefix}.{suffix}"] = mx.concatenate(parts, axis=0)
 
-        # Stack routed expert weights for MTP layers
+        # 6b) Flatten pre-stacked 3D wo_a. Newer mixed-quant checkpoints store the
+        #     grouped output projection as a single [n_groups, o_lora_rank, X] tensor
+        #     (weight/scales/biases) rather than per-group split keys. Our
+        #     QuantizedLinear expects it fused to [n_groups * o_lora_rank, X] and
+        #     re-splits internally in the grouped matmul. Applies to both the main
+        #     layers and the DSpark mtp stages (group-major flatten preserves order).
+        for k in list(weights):
+            if k.endswith(("attn.wo_a.weight", "attn.wo_a.scales", "attn.wo_a.biases")):
+                v = weights[k]
+                if v.ndim == 3:
+                    weights[k] = v.reshape(v.shape[0] * v.shape[1], v.shape[2])
+
+        # Stack routed expert weights for MTP stages (raw HF: per-expert w{1,2,3};
+        # pre-stacked community quants already carry switch_mlp.* and no-op here).
         if has_mtp:
-            for mtp_idx in range(self.args.num_nextn_predict_layers):
-                prefix = f"mtp.{mtp_idx}.block.ffn.experts"
+            for mtp_idx in range(self.args.n_mtp_stages):
+                prefix = f"mtp.{mtp_idx}.ffn.experts"
                 for src, dst in (
                     ("w1", "gate_proj"),
                     ("w2", "down_proj"),
@@ -1616,7 +1678,7 @@ class Model(nn.Module):
                             for e in range(self.args.n_routed_experts)
                         ]
                         weights[
-                            f"mtp.{mtp_idx}.block.ffn.switch_mlp.{dst}.weight"
+                            f"mtp.{mtp_idx}.ffn.switch_mlp.{dst}.weight"
                         ] = mx.stack(stacked)
 
         return weights
