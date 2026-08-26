@@ -10,6 +10,7 @@
 
 import math
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
@@ -447,21 +448,46 @@ class DeepseekV4MoE(nn.Module):
                 swiglu_limit=0.0,
             )
         self.sharding_group = None
+        self._combine = None   # lazily-compiled expert-combine (see __call__)
+
+    def _experts(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
+        """Routed + shared expert combine — the graph-encode-heavy part of the MoE,
+        independent of the gate. Compiled in __call__; bit-identical to the inline
+        form. shared_experts runs before switch_mlp so MLX can overlap both (it does
+        not depend on routing)."""
+        shared_y = self.shared_experts(x) if hasattr(self, "shared_experts") else None
+        y = self.switch_mlp(x, inds)
+        y = (y * weights[..., None]).sum(axis=-2).astype(y.dtype)
+        return y + shared_y if shared_y is not None else y
 
     def __call__(self, x: mx.array, input_ids: mx.array) -> mx.array:
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
         inds, weights = self.gate(x, input_ids)
-        # Compute shared_experts before switch_mlp so MLX can overlap both
-        # on the GPU — shared_experts doesn't depend on routing results.
-        shared_y = self.shared_experts(x) if hasattr(self, "shared_experts") else None
-        y = self.switch_mlp(x, inds)
-        y = (y * weights[..., None]).sum(axis=-2).astype(y.dtype)
-        if shared_y is not None:
-            y = y + shared_y
+        # Compile the expert-combine on first use (batch=1 decode is host-encode-bound;
+        # compiling roughly halves the host ops for this block, bit-identical — verified
+        # maxdiff=0). Lazy so module init / weight load see the eager graph.
+        if self._combine is None:
+            self._combine = mx.compile(self._experts)
+        y = self._combine(x, inds, weights)
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
         return y
+
+
+@lru_cache(maxsize=16)
+def _compressed_col_mask(S_q: int, n_comp: int, r: int, dtype: mx.Dtype) -> mx.array:
+    """Mask columns for the compressed-KV pool, [S_q, n_comp]. Row j summarizes
+    prefill positions [j*r, (j+1)*r), so query row i attends it iff (j+1)*r-1 <= i.
+    Depends only on (S_q, n_comp, r, dtype) — memoized so a multi-token forward builds
+    just one mask per compress-ratio class (reused across all layers of that class)
+    instead of rebuilding it in every compressed layer. bool dtype -> bool mask;
+    else additive 0/-inf."""
+    comp_end = mx.arange(n_comp) * r + (r - 1)
+    keep = mx.arange(S_q)[:, None] >= comp_end[None, :]        # [S_q, n_comp] bool
+    if dtype == mx.bool_:
+        return keep
+    return mx.where(keep, mx.array(0.0, dtype), mx.array(float("-inf"), dtype))
 
 
 # --------------------------------------------------------------------------- #
@@ -1117,18 +1143,12 @@ class V4Attention(nn.Module):
                 # S > sliding_window). Decode (S==1) has mask=None and is skipped.
                 # (from machiabeli/mlx-lm-1 PR #6, local-only)
                 S_q = mask.shape[-2]
-                r = self.compress_ratio
-                comp_end = mx.arange(n_comp) * r + (r - 1)
-                comp_mask = mx.arange(S_q)[:, None] >= comp_end[None, :]
+                comp_mask = _compressed_col_mask(
+                    S_q, n_comp, self.compress_ratio, mask.dtype
+                )
                 comp_mask = mx.broadcast_to(
                     comp_mask, list(mask.shape[:-2]) + [S_q, n_comp]
-                ).astype(mask.dtype)
-                if mask.dtype != mx.bool_:
-                    comp_mask = mx.where(
-                        comp_mask.astype(mx.bool_),
-                        mx.array(0.0, mask.dtype),
-                        mx.array(float("-inf"), mask.dtype),
-                    )
+                )
                 mask = mx.concatenate([comp_mask, mask], axis=-1)
 
         out = scaled_dot_product_attention(
