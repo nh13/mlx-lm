@@ -489,6 +489,12 @@ class CompressedKVCache(KVCache):
         self._index_pool = None
         self._index_buf = None
         self._index_abs_pos = 0
+        # Speculative single-forward rollback state (see spec_begin/spec_trim).
+        self._spec_armed = False
+        self._spec_snap = None
+        self._spec_raw = None
+        self._spec_compressor = None
+        self._spec_index_compressor = None
 
     @property
     def offset(self):
@@ -600,6 +606,44 @@ class CompressedKVCache(KVCache):
     def spec_restore(self, snap):
         (self._pool, self._buf, self._buf_count, self._abs_pos,
          self._index_pool, self._index_buf, self._index_abs_pos) = snap
+
+    def spec_begin(self):
+        """Arm speculative capture for a verify forward. Snapshots the pre-verify
+        pool state and starts recording the raw `accumulate` input so `spec_trim`
+        can rebuild the pool for any accepted prefix in a single forward — no clean
+        re-advance pass needed. Idempotent per verify; cleared by `spec_trim`."""
+        self._spec_snap = self.spec_snapshot()
+        self._spec_raw = None
+        self._spec_compressor = None
+        self._spec_index_compressor = None
+        self._spec_armed = True
+
+    def spec_trim(self, keep: int):
+        """Roll the compressed pool + buffers back to the first `keep` positions of
+        the just-run verify forward, bit-exactly. Replays the tested
+        `_accumulate_window` over the captured raw prefix from the pre-verify
+        snapshot: the emitted rows for the accepted prefix are a prefix of (and
+        identical to) the full verify rows, and the retained raw buffer is
+        reconstructed exactly — including tokens the full forward already dropped at
+        a compression boundary. The local sliding KV is trimmed by the caller."""
+        if not self._spec_armed:
+            return
+        (pool0, buf0, _bc0, abs0, ipool0, ibuf0, iabs0) = self._spec_snap
+        x = self._spec_raw
+        if x is not None and self._spec_compressor is not None:
+            xk = x[:, :keep]
+            self._pool, self._buf, self._abs_pos = self._accumulate_window(
+                pool0, buf0, abs0, xk, self._spec_compressor)
+            self._buf_count = 0 if self._buf is None else self._buf.shape[1]
+            if self._spec_index_compressor is not None:
+                self._index_pool, self._index_buf, self._index_abs_pos = (
+                    self._accumulate_window(
+                        ipool0, ibuf0, iabs0, xk, self._spec_index_compressor))
+        else:
+            # No rows accumulated during verify — restore the pre-verify snapshot.
+            self.spec_restore(self._spec_snap)
+        self._spec_armed = False
+        self._spec_raw = None
 
     @classmethod
     def merge(cls, caches):
@@ -770,6 +814,14 @@ class CompressedKVCache(KVCache):
 
     def accumulate(self, x: mx.array, compressor: "Compressor") -> Optional[mx.array]:
         """Main compressed-KV pool: buffer raw tokens, emit rows on boundaries."""
+        # getattr guard: caches rebuilt via __new__ (from_state/merge/extract) skip
+        # __init__, so the spec fields may be absent; they are only armed by spec_begin.
+        if getattr(self, "_spec_armed", False):
+            self._spec_raw = (
+                x if self._spec_raw is None
+                else mx.concatenate([self._spec_raw, x], axis=1)
+            )
+            self._spec_compressor = compressor
         self._pool, self._buf, self._abs_pos = self._accumulate_window(
             self._pool, self._buf, self._abs_pos, x, compressor
         )
@@ -783,6 +835,9 @@ class CompressedKVCache(KVCache):
         top-k block selection works during generation (it previously recomputed
         on the single decode token, produced no rows, and disabled top-k).
         """
+        if getattr(self, "_spec_armed", False):
+            # Same raw `x` as accumulate(); only the index compressor differs.
+            self._spec_index_compressor = compressor
         self._index_pool, self._index_buf, self._index_abs_pos = self._accumulate_window(
             self._index_pool, self._index_buf, self._index_abs_pos, x, compressor
         )
@@ -1567,26 +1622,31 @@ class Model(nn.Module):
             prev = nxt
         return tokens
 
-    def _dspark_snapshot_target(self, caches: List[Any]):
-        """Snapshot the target caches for spec-verify rollback: each cache's offset
-        plus the compressed-pool state where present (cheap ref save)."""
-        snap = []
+    def _dspark_spec_begin(self, caches: List[Any]) -> List[int]:
+        """Arm single-forward spec rollback before a verify forward: record each
+        cache's pre-verify offset and arm compressed-pool capture. Returns the
+        offsets so `_dspark_spec_commit` knows where the accepted prefix begins."""
+        offsets = []
         for c in caches:
+            offsets.append(c.offset)
             if isinstance(c, CompressedKVCache):
-                snap.append((c.local.offset, c.spec_snapshot()))
-            else:
-                snap.append((c.offset, None))
-        return snap
+                c.spec_begin()
+        return offsets
 
-    def _dspark_restore_target(self, caches: List[Any], snap) -> None:
-        """Undo a spec-verify forward: trim each local sliding KV back to its
-        pre-verify offset and restore the compressed pool."""
-        for c, (off, pool) in zip(caches, snap):
+    def _dspark_spec_commit(
+        self, caches: List[Any], offsets: List[int], keep: int
+    ) -> None:
+        """Roll each target cache back to `keep` positions past its pre-verify
+        offset — the accepted prefix [pending] + accepted drafts — in a single
+        forward (no clean re-advance). The compressed pool is rebuilt bit-exactly
+        by `spec_trim`; the local sliding KV is trimmed to the same length."""
+        for c, off in zip(caches, offsets):
+            target = off + keep
             if isinstance(c, CompressedKVCache):
-                c.local.trim(c.local.offset - off)
-                c.spec_restore(pool)
+                c.spec_trim(keep)
+                c.local.trim(c.local.offset - target)
             else:
-                c.trim(c.offset - off)
+                c.trim(c.offset - target)
 
     def dspark_generate(
         self,
@@ -1608,11 +1668,12 @@ class Model(nn.Module):
         length-dependent rounding effect), so bit-exact identity is not a meaningful gate
         there.
 
-        PERFORMANCE: this reference implementation runs two target forwards per round
-        (verify, then a clean advance of the accepted tokens) because exact single-forward
-        rollback of the compressed-KV pool is a follow-up. It is therefore not yet faster
-        than plain decode; the structure (draft -> verify -> accept -> commit, with
-        draft-side ctx rollback) is correct and ready for that optimization.
+        PERFORMANCE: one target forward per round. The verify forward's own KV/pool
+        entries for the accepted prefix are committed in place via exact single-forward
+        rollback (`spec_begin`/`spec_trim`): the compressed-KV pool is rebuilt from the
+        pre-verify snapshot over the captured accepted raw tokens, so no clean re-advance
+        pass is needed. This also makes the committed cache numerically self-consistent
+        with the forward that made the accept decision.
 
         Returns (token_ids, stats) where stats has `mean_accept_len` and `rounds`.
         """
@@ -1643,8 +1704,9 @@ class Model(nn.Module):
             for c, off in zip(ctxc, ctx_off):
                 c.trim(c.offset - off)
 
-            # --- verify [pending] + drafted against the target (appends to tgt) ---
-            snap = self._dspark_snapshot_target(tgt)
+            # --- verify [pending] + drafted against the target (single forward;
+            #     arm exact rollback so the accepted prefix is kept in place) ---
+            offsets = self._dspark_spec_begin(tgt)
             vlogits, vtap = self.dspark_tap(mx.array([[pending] + drafted]), tgt, collapse)
             tt = mx.argmax(vlogits[0], axis=-1)
             mx.eval(tt)
@@ -1659,10 +1721,9 @@ class Model(nn.Module):
             accept_lens.append(len(committed))
 
             # commit context with the accepted positions [pending]+accepted (verify tap is
-            # causally valid to reuse), then re-advance the target cache cleanly.
+            # causally valid to reuse), then roll the target cache back to that prefix.
             self.dspark_update_context(vtap[:, : n + 1, :], committed_len, ctxc)
-            self._dspark_restore_target(tgt, snap)
-            self.dspark_tap(mx.array([[pending] + drafted[:n]]), tgt, collapse)
+            self._dspark_spec_commit(tgt, offsets, n + 1)
             committed_len += n + 1
 
             for t in committed:
