@@ -21,16 +21,23 @@ class TestDeepSeekV4ToolParser(unittest.TestCase):
 
     def test_wellformed_single_call(self):
         text = (
-            '<｜DSML｜tool_calls>\n'
+            "<｜DSML｜tool_calls>\n"
             '<｜DSML｜invoke name="get_weather">\n'
             '<｜DSML｜parameter name="location" string="true">Paris, France</｜DSML｜parameter>\n'
             '<｜DSML｜parameter name="unit" string="true">celsius</｜DSML｜parameter>\n'
-            '</｜DSML｜invoke>\n'
-            '</｜DSML｜tool_calls>'
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>"
         )
         calls = deepseek_v4.parse_tool_call(text, [])
-        self.assertEqual(calls, [{"name": "get_weather",
-                                  "arguments": {"location": "Paris, France", "unit": "celsius"}}])
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "name": "get_weather",
+                    "arguments": {"location": "Paris, France", "unit": "celsius"},
+                }
+            ],
+        )
 
     def test_string_false_json_values(self):
         # string="false" => value is JSON (number, bool, array, object).
@@ -40,7 +47,7 @@ class TestDeepSeekV4ToolParser(unittest.TestCase):
             '<｜DSML｜parameter name="enabled" string="false">true</｜DSML｜parameter>\n'
             '<｜DSML｜parameter name="tags" string="false">["a", "b"]</｜DSML｜parameter>\n'
             '<｜DSML｜parameter name="label" string="true">hello</｜DSML｜parameter>\n'
-            '</｜DSML｜invoke>'
+            "</｜DSML｜invoke>"
         )
         calls = deepseek_v4.parse_tool_call(text, [])
         self.assertEqual(len(calls), 1)
@@ -55,44 +62,55 @@ class TestDeepSeekV4ToolParser(unittest.TestCase):
     def test_lenient_truncated_close_tag(self):
         # Exact assistant output captured from 4/5/6-bit: close tag truncated to inv.
         text = (
-            '<｜DSML｜tool_calls>\n'
+            "<｜DSML｜tool_calls>\n"
             '<｜DSML｜invoke name="get_weather">\n'
             '<｜DSML｜parameter name="location" string="true">Paris, France</｜DSML｜parameter>\n'
             '<｜DSML｜parameter name="unit" string="true">celsius</｜DSML｜parameter>\n'
-            '</｜DSML｜inv>\n'
-            '</｜DSML｜tool_calls>'
+            "</｜DSML｜inv>\n"
+            "</｜DSML｜tool_calls>"
         )
         calls = deepseek_v4.parse_tool_call(text, [])
-        self.assertEqual(calls, [{"name": "get_weather",
-                                  "arguments": {"location": "Paris, France", "unit": "celsius"}}])
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "name": "get_weather",
+                    "arguments": {"location": "Paris, France", "unit": "celsius"},
+                }
+            ],
+        )
 
     def test_multiple_invokes(self):
         text = (
-            '<｜DSML｜tool_calls>\n'
+            "<｜DSML｜tool_calls>\n"
             '<｜DSML｜invoke name="get_weather">\n'
             '<｜DSML｜parameter name="location" string="true">Tokyo</｜DSML｜parameter>\n'
-            '</｜DSML｜invoke>\n'
+            "</｜DSML｜invoke>\n"
             '<｜DSML｜invoke name="search">\n'
             '<｜DSML｜parameter name="query" string="true">news</｜DSML｜parameter>\n'
-            '</｜DSML｜inv>\n'
-            '</｜DSML｜tool_calls>'
+            "</｜DSML｜inv>\n"
+            "</｜DSML｜tool_calls>"
         )
         calls = deepseek_v4.parse_tool_call(text, [])
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0], {"name": "get_weather", "arguments": {"location": "Tokyo"}})
+        self.assertEqual(
+            calls[0], {"name": "get_weather", "arguments": {"location": "Tokyo"}}
+        )
         self.assertEqual(calls[1], {"name": "search", "arguments": {"query": "news"}})
 
     def test_embedded_in_assistant_text(self):
         # The parser tolerates surrounding text (e.g. a trailing newline block).
         text = (
-            'some preamble\n\n<｜DSML｜tool_calls>\n'
+            "some preamble\n\n<｜DSML｜tool_calls>\n"
             '<｜DSML｜invoke name="get_weather">\n'
             '<｜DSML｜parameter name="location" string="true">Berlin</｜DSML｜parameter>\n'
-            '</｜DSML｜invoke>\n'
-            '</｜DSML｜tool_calls>\n'
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>\n"
         )
         calls = deepseek_v4.parse_tool_call(text, [])
-        self.assertEqual(calls, [{"name": "get_weather", "arguments": {"location": "Berlin"}}])
+        self.assertEqual(
+            calls, [{"name": "get_weather", "arguments": {"location": "Berlin"}}]
+        )
 
     def test_no_invoke_raises(self):
         with self.assertRaises(ValueError):

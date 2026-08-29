@@ -401,8 +401,10 @@ def _tool_grammar_processors(base, request, tokenizer):
         return base
     tools = getattr(request, "tools", None)
     choice = getattr(request, "tool_choice", "auto")
-    if not tools or choice == "none" or not getattr(
-        tokenizer, "has_tool_calling", False
+    if (
+        not tools
+        or choice == "none"
+        or not getattr(tokenizer, "has_tool_calling", False)
     ):
         return base
     from .tool_grammar import ToolCallGrammar

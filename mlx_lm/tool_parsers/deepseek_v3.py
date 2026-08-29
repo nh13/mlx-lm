@@ -57,7 +57,10 @@ def _coerce_arguments(raw: str) -> dict[str, Any]:
 def parse_tool_call(text: str, tools: list[Any] | None = None):
     """Parse a DeepSeek tool-call region into a list of ``{name, arguments}`` dicts."""
     calls = [
-        dict(name=match.group("name").strip(), arguments=_coerce_arguments(match.group("args")))
+        dict(
+            name=match.group("name").strip(),
+            arguments=_coerce_arguments(match.group("args")),
+        )
         for match in _TOOL_CALL_RE.finditer(text)
     ]
     if not calls:

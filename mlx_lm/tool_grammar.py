@@ -99,7 +99,7 @@ def _suffix_after(seg: Tuple[int, ...], prefix: Tuple[int, ...]) -> Tuple[int, .
     Used to force the remainder of a literal once the model has already emitted a
     shared opening (``<`` or ``</`` or ``<｜DSML｜``) on its own.
     """
-    return seg[len(prefix):]
+    return seg[len(prefix) :]
 
 
 def _tool_name(tool: Any) -> str:
@@ -297,7 +297,8 @@ class _ToolGrammarState:
             return
         if p == "name":
             self._name_cands = [
-                s for s in self._name_cands
+                s
+                for s in self._name_cands
                 if len(s) > self._name_pos and s[self._name_pos] == tok
             ]
             self._name_pos += 1
@@ -319,14 +320,18 @@ class _ToolGrammarState:
             return
         if p == "pname":
             self._pname_cands = [
-                s for s in self._pname_cands
+                s
+                for s in self._pname_cands
                 if len(s) > self._pname_pos and s[self._pname_pos] == tok
             ]
             self._pname_pos += 1
             if not any(len(s) > self._pname_pos for s in self._pname_cands):
                 self._resolve_pname()
-                seg = (self._g.param_str_true if self._pending_is_str
-                       else self._g.param_str_false)
+                seg = (
+                    self._g.param_str_true
+                    if self._pending_is_str
+                    else self._g.param_str_false
+                )
                 self._begin_force(seg, then="value")
             return
         if p == "value":
@@ -355,13 +360,19 @@ class _ToolGrammarState:
 
     def _resolve_tool(self) -> None:
         matched = [s for s in self._name_cands if len(s) == self._name_pos]
-        seq = matched[0] if matched else (self._name_cands[0] if self._name_cands else ())
+        seq = (
+            matched[0] if matched else (self._name_cands[0] if self._name_cands else ())
+        )
         name = self._g.decode(list(seq)).strip()
         self._cur_params = self._g.params_by_tool.get(name, [])
 
     def _resolve_pname(self) -> None:
         matched = [s for s in self._pname_cands if len(s) == self._pname_pos]
-        seq = matched[0] if matched else (self._pname_cands[0] if self._pname_cands else ())
+        seq = (
+            matched[0]
+            if matched
+            else (self._pname_cands[0] if self._pname_cands else ())
+        )
         pname = self._g.decode(list(seq)).strip()
         self._pending_is_str = self._pname_map.get(pname, True)
         # a parameter is emitted at most once
@@ -375,12 +386,16 @@ class _ToolGrammarState:
         if p == "force":
             return self._allow(logits, (self._seg[0],)) if self._seg else logits
         if p == "name":
-            allowed = {s[self._name_pos] for s in self._name_cands
-                       if len(s) > self._name_pos}
+            allowed = {
+                s[self._name_pos] for s in self._name_cands if len(s) > self._name_pos
+            }
             return self._allow(logits, allowed) if allowed else logits
         if p == "pname":
-            allowed = {s[self._pname_pos] for s in self._pname_cands
-                       if len(s) > self._pname_pos}
+            allowed = {
+                s[self._pname_pos]
+                for s in self._pname_cands
+                if len(s) > self._pname_pos
+            }
             return self._allow(logits, allowed) if allowed else logits
         if p in ("pci", "icc"):
             # model chooses: `<` opens the next element, `</` closes this one
@@ -410,7 +425,7 @@ class ToolCallGrammar:
         # `<` (id for "<"); close tags begin with `</`, which is ONE token in
         # this vocab (distinct from "<" and "/") -- the crux of the boundary.
         self.dsml_id = _encode(tokenizer, _DSML)[0]  # ｜DSML｜
-        self.lt_id = _encode(tokenizer, "<")[0]      # `<`  opens a tag
+        self.lt_id = _encode(tokenizer, "<")[0]  # `<`  opens a tag
         self.close_id = _encode(tokenizer, "</")[0]  # `</` opens a close tag
 
         # Thinking-block markers (single special tokens in the DeepSeek vocab);

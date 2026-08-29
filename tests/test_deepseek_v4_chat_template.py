@@ -24,7 +24,9 @@ def _load_reference():
         if not base:
             continue
         hits = glob.glob(
-            os.path.join(base, "hub/models--deepseek-ai--DeepSeek-V4-Flash*/snapshots/*/encoding")
+            os.path.join(
+                base, "hub/models--deepseek-ai--DeepSeek-V4-Flash*/snapshots/*/encoding"
+            )
         )
         if hits:
             sys.path.insert(0, hits[0])
@@ -36,21 +38,27 @@ def _load_reference():
 
 _REF = _load_reference()
 
-TOOLS = [{
-    "type": "function",
-    "function": {
-        "name": "get_weather",
-        "description": "Get the weather for a specific location",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "location": {"type": "string", "description": "The city name"},
-                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"], "description": "Temperature unit"},
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the weather for a specific location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "The city name"},
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "Temperature unit",
+                    },
+                },
+                "required": ["location"],
             },
-            "required": ["location"],
         },
-    },
-}]
+    }
+]
 
 
 def _msgs(extra=()):
@@ -73,14 +81,27 @@ class TestChatTemplateVsReference(unittest.TestCase):
 
     def test_apply_chat_template_generation_prompt(self):
         self.assertEqual(
-            v4.apply_chat_template(_msgs(), add_generation_prompt=True, thinking_mode="thinking"),
+            v4.apply_chat_template(
+                _msgs(), add_generation_prompt=True, thinking_mode="thinking"
+            ),
             _REF.encode_messages(_msgs(), thinking_mode="thinking"),
         )
 
     def test_assistant_tool_call_replay_and_result(self):
         extra = [
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"type": "function", "function": {"name": "get_weather", "arguments": '{"location": "Paris"}'}}]},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"location": "Paris"}',
+                        },
+                    }
+                ],
+            },
             {"role": "tool", "content": "15C and sunny", "tool_call_id": "c1"},
         ]
         for mode in ("chat", "thinking"):
@@ -109,7 +130,10 @@ class TestServerCallingConvention(unittest.TestCase):
 
     def test_tools_kwarg_matches_tools_on_system_message(self):
         via_kwarg = v4.apply_chat_template(
-            _msgs_tools_kwarg(), tools=TOOLS, add_generation_prompt=True, enable_thinking=True
+            _msgs_tools_kwarg(),
+            tools=TOOLS,
+            add_generation_prompt=True,
+            enable_thinking=True,
         )
         via_message = v4.apply_chat_template(
             _msgs(), add_generation_prompt=True, enable_thinking=True
@@ -119,10 +143,16 @@ class TestServerCallingConvention(unittest.TestCase):
 
     def test_enable_thinking_selects_mode(self):
         thinking = v4.apply_chat_template(
-            _msgs_tools_kwarg(), tools=TOOLS, add_generation_prompt=True, enable_thinking=True
+            _msgs_tools_kwarg(),
+            tools=TOOLS,
+            add_generation_prompt=True,
+            enable_thinking=True,
         )
         chat = v4.apply_chat_template(
-            _msgs_tools_kwarg(), tools=TOOLS, add_generation_prompt=True, enable_thinking=False
+            _msgs_tools_kwarg(),
+            tools=TOOLS,
+            add_generation_prompt=True,
+            enable_thinking=False,
         )
         self.assertTrue(thinking.endswith("<｜Assistant｜><think>"))
         self.assertTrue(chat.endswith("<｜Assistant｜></think>"))
@@ -160,7 +190,9 @@ class TestChatTemplateInvariants(unittest.TestCase):
         self.assertTrue(out.endswith("<｜Assistant｜><think>"))
 
     def test_chat_mode_closes_think(self):
-        out = v4.encode_messages([{"role": "user", "content": "hi"}], thinking_mode="chat")
+        out = v4.encode_messages(
+            [{"role": "user", "content": "hi"}], thinking_mode="chat"
+        )
         self.assertTrue(out.endswith("<｜Assistant｜></think>"))
 
 

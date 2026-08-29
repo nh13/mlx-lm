@@ -30,21 +30,21 @@ usage, does not reach them):
 from typing import Any, Dict, List
 
 from mlx_lm.chat_templates.deepseek_v32 import (
-    bos_token,
-    eos_token,
-    thinking_start_token,
-    thinking_end_token,
-    dsml_token,
-    system_msg_template,
-    user_msg_template,
     assistant_msg_template,
+    bos_token,
+    drop_thinking_messages,
+    dsml_token,
+    encode_arguments_to_dsml,
+    eos_token,
+    find_last_user_index,
+    system_msg_template,
+    thinking_end_token,
+    thinking_start_token,
     thinking_template,
     to_json,
-    tools_from_openai_format,
     tool_calls_from_openai_format,
-    encode_arguments_to_dsml,
-    find_last_user_index,
-    drop_thinking_messages,
+    tools_from_openai_format,
+    user_msg_template,
 )
 
 # --- V4-specific templates (differ from V3.2: wording + the `tool_calls` tag) ---
@@ -76,8 +76,12 @@ Otherwise, output directly after </think> with tool calls or final response.
 You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
 """
 
-tool_call_template = '<{dsml_token}invoke name="{name}">\n{arguments}\n</{dsml_token}invoke>'
-tool_calls_template = "<{dsml_token}tool_calls>\n{tool_calls}\n</{dsml_token}tool_calls>"
+tool_call_template = (
+    '<{dsml_token}invoke name="{name}">\n{arguments}\n</{dsml_token}invoke>'
+)
+tool_calls_template = (
+    "<{dsml_token}tool_calls>\n{tool_calls}\n</{dsml_token}tool_calls>"
+)
 tool_output_template = "<tool_result>{content}</tool_result>"
 
 
@@ -100,8 +104,13 @@ def render_tools(tools: List[Dict[str, Any]]) -> str:
     )
 
 
-def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: str) -> str:
-    assert thinking_mode in ("chat", "thinking"), f"Invalid thinking_mode `{thinking_mode}`"
+def render_message(
+    index: int, messages: List[Dict[str, Any]], thinking_mode: str
+) -> str:
+    assert thinking_mode in (
+        "chat",
+        "thinking",
+    ), f"Invalid thinking_mode `{thinking_mode}`"
     msg = messages[index]
     role = msg.get("role")
     content = msg.get("content")
@@ -126,15 +135,20 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
         return user_msg_template.format(content=content) + turn_suffix()
 
     if role == "tool":
-        return user_msg_template.format(
-            content=tool_output_template.format(content=content)
-        ) + turn_suffix()
+        return (
+            user_msg_template.format(
+                content=tool_output_template.format(content=content)
+            )
+            + turn_suffix()
+        )
 
     if role == "assistant":
         reasoning = ""
         if thinking_mode == "thinking" and index > find_last_user_index(messages):
             reasoning = (
-                thinking_template.format(reasoning_content=msg.get("reasoning_content") or "")
+                thinking_template.format(
+                    reasoning_content=msg.get("reasoning_content") or ""
+                )
                 + thinking_end_token
             )
         tool_calls_content = ""
@@ -211,7 +225,9 @@ def apply_chat_template(
             "Only one of continue_final_message or add_generation_prompt can be True"
         )
     if thinking_mode is None:
-        thinking_mode = "thinking" if (enable_thinking is None or enable_thinking) else "chat"
+        thinking_mode = (
+            "thinking" if (enable_thinking is None or enable_thinking) else "chat"
+        )
     encode_kwargs = {
         k: kwargs[k] for k in ("drop_thinking", "add_default_bos_token") if k in kwargs
     }

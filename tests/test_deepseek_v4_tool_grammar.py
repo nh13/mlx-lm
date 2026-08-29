@@ -17,7 +17,7 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.tool_grammar import ToolCallGrammar, _MaskCache, _MASK_FILL
+from mlx_lm.tool_grammar import _MASK_FILL, ToolCallGrammar, _MaskCache
 from mlx_lm.tool_parsers import deepseek_v4
 
 
@@ -31,7 +31,9 @@ def _load_tokenizer():
         if not base:
             continue
         hits = glob.glob(
-            os.path.join(base, "hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/*/")
+            os.path.join(
+                base, "hub/models--mlx-community--DeepSeek-V4-Flash-4bit/snapshots/*/"
+            )
         )
         if hits:
             from transformers import AutoTokenizer
@@ -166,20 +168,36 @@ class TestGrammarForcedOutput(unittest.TestCase):
 
     def test_required_mode_parses(self):
         g = ToolCallGrammar(_TOK, [READ_TOOL], tool_choice="required")
-        out = _drive(g, _TOK.encode("dummy prompt", add_special_tokens=False), "read", READ_PARAMS)
+        out = _drive(
+            g,
+            _TOK.encode("dummy prompt", add_special_tokens=False),
+            "read",
+            READ_PARAMS,
+        )
         self._assert_read_call(out)
 
     def test_auto_mode_parses(self):
         g = ToolCallGrammar(_TOK, [READ_TOOL], tool_choice="auto")
-        out = _drive(g, _TOK.encode("dummy prompt", add_special_tokens=False), "read", READ_PARAMS)
+        out = _drive(
+            g,
+            _TOK.encode("dummy prompt", add_special_tokens=False),
+            "read",
+            READ_PARAMS,
+        )
         self._assert_read_call(out)
 
     def test_named_choice_forces_that_tool(self):
         g = ToolCallGrammar(
-            _TOK, [READ_TOOL, WRITE_TOOL],
+            _TOK,
+            [READ_TOOL, WRITE_TOOL],
             tool_choice={"type": "function", "function": {"name": "read"}},
         )
-        out = _drive(g, _TOK.encode("dummy prompt", add_special_tokens=False), "read", READ_PARAMS)
+        out = _drive(
+            g,
+            _TOK.encode("dummy prompt", add_special_tokens=False),
+            "read",
+            READ_PARAMS,
+        )
         self._assert_read_call(out)
 
     def test_await_think_defers_forcing_until_think_close(self):
@@ -190,7 +208,9 @@ class TestGrammarForcedOutput(unittest.TestCase):
         self.assertIsNotNone(g.think_end_id)
         proc = g.logits_processor()
         vocab = len(_TOK)
-        tokens = _TOK.encode("reason first", add_special_tokens=False) + [g.think_start_id]
+        tokens = _TOK.encode("reason first", add_special_tokens=False) + [
+            g.think_start_id
+        ]
         proc(mx.array(tokens), mx.zeros((1, vocab)))
         self.assertEqual(proc._phase, "await_think")
         for t in _TOK.encode(" thinking...", add_special_tokens=False):
@@ -221,8 +241,11 @@ class TestGrammarForcedOutput(unittest.TestCase):
         for _ in range(400):
             row = mx.array(proc(mx.array(tokens), mx.zeros((1, vocab))))[0]
             if proc._phase == "value":
-                self.assertLess(float(row[g.dsml_id]), _MASK_FILL / 2,
-                                "｜DSML｜ should be masked out of a value")
+                self.assertLess(
+                    float(row[g.dsml_id]),
+                    _MASK_FILL / 2,
+                    "｜DSML｜ should be masked out of a value",
+                )
                 return
             tokens.append(int(model.next_token(proc)))
         self.fail("never reached value phase")

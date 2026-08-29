@@ -48,7 +48,9 @@ _INVOKE_RE = re.compile(
 )
 _PARAM_RE = re.compile(
     r"<" + re.escape(_DSML) + r'parameter\s+name="(?P<name>.*?)"\s+'
-    r'string="(?P<is_str>true|false)"\s*>(?P<value>.*?)</' + re.escape(_DSML) + r"parameter>",
+    r'string="(?P<is_str>true|false)"\s*>(?P<value>.*?)</'
+    + re.escape(_DSML)
+    + r"parameter>",
     re.DOTALL,
 )
 
