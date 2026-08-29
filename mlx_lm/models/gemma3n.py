@@ -127,15 +127,19 @@ class Gemma3nAttention(nn.Module):
         queries = queries.reshape(B, L, -1, self.head_dim)
         queries = self.q_norm(queries)
 
-        offset = 0
+        offset = cache.offset if cache is not None else 0
+        if isinstance(offset, mx.array):
+            # Batched caches mutate offset (an mx.array) in place in
+            # update_and_fetch; snapshot it as the queries are RoPE'd after that.
+            offset = mx.array(offset)
+
         if self.is_kv_shared_layer and cache is not None:
-            # For shared layers, retrieve KV from the designated cache layer
-            keys, values = cache.state
-            offset = cache.offset
+            # Shared cache: state[:2] drops the batched caches' extra state, and
+            # its concrete owner already advanced offset by L earlier this pass.
+            keys, values = cache.state[:2]
+            offset = offset - L
 
         else:
-            if cache is not None:
-                offset = cache.offset
             keys = self.k_proj(x).reshape(B, L, -1, self.head_dim)
             keys = self.k_norm(keys)
             keys = keys.transpose(0, 2, 1, 3)
