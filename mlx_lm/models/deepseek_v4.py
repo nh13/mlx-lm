@@ -11,7 +11,7 @@
 import math
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -71,6 +71,9 @@ class ModelArgs(BaseModelArgs):
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
 
+    # Multi-token prediction (MTP) heads; built when > 0.
+    num_nextn_predict_layers: int = 1
+
     # RoPE / YaRN
     max_position_embeddings: int = 1048576
     rope_theta: float = 10000.0
@@ -95,9 +98,11 @@ class ModelArgs(BaseModelArgs):
                 "`compress_ratios` must have at least one entry per hidden layer, "
                 f"got {len(self.compress_ratios)} for {self.num_hidden_layers} layers."
             )
-        # Extra trailing entries (the checkpoint lists them for its MTP layers) are
-        # ignored, matching the dropped MTP weights.
-        self.compress_ratios = list(self.compress_ratios[: self.num_hidden_layers])
+        # Cover the base layers plus the MTP layers, which default to 0.
+        total_layers = self.num_hidden_layers + self.num_nextn_predict_layers
+        self.compress_ratios = list(self.compress_ratios[:total_layers])
+        while len(self.compress_ratios) < total_layers:
+            self.compress_ratios.append(0)
         bad = [r for r in self.compress_ratios if r not in (0, 4, 128)]
         if bad:
             raise ValueError(f"Unsupported DeepSeek-V4 compress ratios: {bad}")
@@ -1631,6 +1636,44 @@ class DeepseekV4Block(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# MTP Block (next-N-token prediction head, from Blaizzy/mlx-lm PR #15)         #
+# --------------------------------------------------------------------------- #
+
+
+class MTPBlock(nn.Module):
+    """Next-N-token prediction head: re-mixes the previous hidden state with the
+    embedded "next" token, then runs a copy of the V4 block + hc_head. Present as
+    scaffolding for MTP decoding, which is wired up in a follow-up."""
+
+    def __init__(self, args: ModelArgs, layer_idx: int):
+        super().__init__()
+        dim = args.hidden_size
+        self.block = DeepseekV4Block(args, layer_idx)
+        self.e_proj = nn.Linear(dim, dim, bias=False)
+        self.h_proj = nn.Linear(dim, dim, bias=False)
+        self.enorm = nn.RMSNorm(dim, eps=args.rms_norm_eps)
+        self.hnorm = nn.RMSNorm(dim, eps=args.rms_norm_eps)
+        self.norm = nn.RMSNorm(dim, eps=args.rms_norm_eps)
+        self.hc_head = HyperHead(
+            args.hidden_size, args.hc_mult, args.rms_norm_eps, args.hc_eps
+        )
+
+    def __call__(
+        self,
+        h: mx.array,
+        embed_tokens: nn.Embedding,
+        input_ids: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+    ) -> mx.array:
+        e = self.enorm(embed_tokens(input_ids))
+        h_norm = self.hnorm(h)
+        x = self.e_proj(e)[:, :, None, :] + self.h_proj(h_norm)
+        x = mx.contiguous(x)
+        return self.block(x, mask, cache, input_ids)
+
+
+# --------------------------------------------------------------------------- #
 # Model                                                                       #
 # --------------------------------------------------------------------------- #
 
@@ -1726,6 +1769,11 @@ class Model(nn.Module):
         self.model_type = args.model_type
         self.model = DeepseekV4Model(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if args.num_nextn_predict_layers > 0:
+            n = args.num_hidden_layers
+            self.mtp = [
+                MTPBlock(args, n + i) for i in range(args.num_nextn_predict_layers)
+            ]
 
     def __call__(
         self,
@@ -1754,6 +1802,44 @@ class Model(nn.Module):
             return True
 
         return pred
+
+    def make_mtp_cache(self):
+        if not hasattr(self, "mtp"):
+            return None
+        caches = []
+        for mtp_block in self.mtp:
+            attn = mtp_block.block.attn
+            if attn.compress_ratio:
+                caches.append(CompressedKVCache(max_size=self.args.sliding_window))
+            else:
+                caches.append(RotatingKVCache(max_size=self.args.sliding_window))
+        return caches
+
+    def mtp_forward(
+        self,
+        h: mx.array,
+        input_ids: mx.array,
+        cache: Optional[List[Any]] = None,
+    ) -> mx.array:
+        if cache is None:
+            cache = [None] * len(self.mtp)
+        first_cache = cache[0]
+        mask_cache = (
+            first_cache.local
+            if isinstance(first_cache, CompressedKVCache)
+            else first_cache
+        )
+        mask = create_attention_mask(
+            h[:, :, 0, :] if h.ndim == 4 else h,
+            mask_cache,
+            window_size=self.args.sliding_window,
+            return_array=True,
+        )
+        for mtp_block, layer_cache in zip(self.mtp, cache):
+            h = mtp_block(h, self.model.embed_tokens, input_ids, mask, layer_cache)
+        out = mtp_block.hc_head(h)
+        out = mtp_block.norm(out)
+        return self.lm_head(out)
 
     def make_cache(self):
         caches = []
@@ -1794,9 +1880,12 @@ class Model(nn.Module):
         """
         n_layers = self.args.num_hidden_layers
 
-        # 1) Drop MTP weights: this model does base-model inference only, so the
-        # multi-token-prediction heads some checkpoints carry are not consumed
-        # here. Base layers beyond num_hidden_layers are dropped below.
+        # 1) Drop MTP weights and the (unused) MTP module. The MTP module here is
+        # scaffolding for MTP decoding; the heads real checkpoints ship do not map
+        # to it yet, so they are dropped and the base model is loaded. Base layers
+        # beyond num_hidden_layers are dropped below.
+        if hasattr(self, "mtp"):
+            del self.mtp
         new_weights = {}
         for k, v in weights.items():
             if k.startswith("mtp."):
