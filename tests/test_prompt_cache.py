@@ -603,6 +603,35 @@ class TestPromptCache(unittest.TestCase):
         )
         self.assertTrue(mx.array_equal(mask.squeeze(), expected))
 
+    def test_batch_cache_offset_not_mutated_in_place(self):
+        # The batched caches advance their mx.array `offset` in update_and_fetch.
+        # Assert the advance rebinds, so a reference captured before the update and
+        # reused after (as deepseek_v4/gemma do) keeps its pre-update value.
+        def assert_stable(cache, S):
+            k = mx.zeros((2, 1, S, 4))
+            v = mx.zeros((2, 1, S, 4))
+            captured = cache.offset
+            pre = captured.tolist()
+            cache.update_and_fetch(k, v)
+            mx.eval(cache.offset, captured)
+            self.assertEqual(captured.tolist(), pre)
+            self.assertEqual(cache.offset.tolist(), [p + S for p in pre])
+
+        assert_stable(BatchKVCache(left_padding=[0, 0]), 5)
+        assert_stable(BatchKVCache(left_padding=[0, 0]), 1)
+        # BatchRotatingKVCache concat (S>1) and in-place (S==1) update paths.
+        assert_stable(BatchRotatingKVCache(max_size=16, left_padding=[0, 0]), 5)
+        assert_stable(BatchRotatingKVCache(max_size=16, left_padding=[0, 0]), 1)
+
+        # trim() also rebinds offset; a captured reference must survive it.
+        cache = BatchKVCache(left_padding=[0, 0])
+        cache.update_and_fetch(mx.zeros((2, 1, 5, 4)), mx.zeros((2, 1, 5, 4)))
+        captured = cache.offset
+        cache.trim(2)
+        mx.eval(cache.offset, captured)
+        self.assertEqual(captured.tolist(), [5, 5])
+        self.assertEqual(cache.offset.tolist(), [3, 3])
+
     def test_save_load_batch_caches(self):
         cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
 
