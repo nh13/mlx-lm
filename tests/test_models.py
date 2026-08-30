@@ -2188,6 +2188,136 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def _tiny_gemma3n_model(self):
+        # Tiny gemma3n with KV-shared + concrete sliding/full attention layers.
+        from mlx_lm.models import gemma3n
+
+        args = gemma3n.ModelArgs(
+            model_type="gemma3n",
+            text_config={
+                "model_type": "gemma3n",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "head_dim": 32,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1024,
+                "num_key_value_heads": 2,
+                "num_kv_shared_layers": 2,
+                "vocab_size_per_layer_input": 1024,
+                "sliding_window": 8,
+                "max_position_embeddings": 256,
+                "rope_local_base_freq": 1.0,
+                "rope_theta": 1000.0,
+                "final_logit_softcapping": 1.0,
+                "layer_types": [
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "activation_sparsity_pattern": [0.5, 0.5, 0.5, 0.5],
+                "hidden_size_per_layer_input": 256,
+                "altup_num_inputs": 4,
+                "altup_coef_clip": 1.0,
+                "altup_correct_scale": True,
+                "altup_active_idx": 0,
+                "laurel_rank": 8,
+            },
+        )
+        model = gemma3n.Model(args)
+        mx.eval(model.parameters())
+        return model
+
+    def test_gemma3n_batched_matches_sequential(self):
+        # Batched caches (from merge()) use an mx.array offset and a 4-tuple
+        # state; assert batched decode stays bit-exact with sequential decode.
+        from mlx_lm.models.cache import BatchKVCache, BatchRotatingKVCache
+
+        model = self._tiny_gemma3n_model()
+        prompt = mx.array([[7, 3, 11, 0, 5, 9, 2, 8, 1, 6, 4]], dtype=mx.int32)
+
+        # Sequential path (int offset) is the immune ground truth.
+        seq_cache = model.make_cache()
+        model(prompt, cache=seq_cache)
+        # Batched path: merge() -> BatchRotatingKVCache / BatchKVCache (mx.array offset).
+        batch_cache = [type(c).merge([c]) for c in model.make_cache()]
+        self.assertIsInstance(batch_cache[0], BatchRotatingKVCache)
+        self.assertIsInstance(batch_cache[1], BatchKVCache)
+        model(prompt, cache=batch_cache)
+
+        token = mx.array([[10]], dtype=mx.int32)
+        for step in range(6):
+            seq_logits = model(token, cache=seq_cache)[:, -1, :]
+            batch_logits = model(token, cache=batch_cache)[:, -1, :]
+            self.assertTrue(
+                mx.allclose(seq_logits, batch_logits, atol=1e-4).item(),
+                msg=f"batched decode diverged from sequential at step {step}",
+            )
+            token = mx.argmax(seq_logits, axis=-1)[:, None].astype(mx.int32)
+
+    def test_gemma3n_batched_multi_sequence_matches_sequential(self):
+        # B=2 with different prompt lengths (non-zero left_padding): each
+        # sequence's batched logits must match its own sequential decode.
+        from mlx_lm.models.cache import BatchKVCache, BatchRotatingKVCache
+
+        model = self._tiny_gemma3n_model()
+        prompt_a = mx.array([[7, 3, 11, 0, 5, 9, 2, 8, 1, 6, 4]], dtype=mx.int32)
+        prompt_b = mx.array([[1, 2, 3, 4, 5, 6, 7]], dtype=mx.int32)  # shorter
+
+        # Per-sequence sequential ground truth.
+        seq_a = model.make_cache()
+        model(prompt_a, cache=seq_a)
+        seq_b = model.make_cache()
+        model(prompt_b, cache=seq_b)
+        # Fresh per-sequence caches merged into one B=2 batch.
+        merge_a = model.make_cache()
+        model(prompt_a, cache=merge_a)
+        merge_b = model.make_cache()
+        model(prompt_b, cache=merge_b)
+        batch_cache = [type(a).merge([a, b]) for a, b in zip(merge_a, merge_b)]
+        self.assertIsInstance(batch_cache[0], BatchRotatingKVCache)
+        self.assertIsInstance(batch_cache[1], BatchKVCache)
+        # Full-attention cache left-pads the shorter sequence (11 - 7 = 4).
+        self.assertEqual(batch_cache[1].left_padding.tolist(), [0, 4])
+
+        tok_a = mx.array([[10]], dtype=mx.int32)
+        tok_b = mx.array([[9]], dtype=mx.int32)
+        for step in range(5):
+            seq_a_logits = model(tok_a, cache=seq_a)[:, -1, :]
+            seq_b_logits = model(tok_b, cache=seq_b)[:, -1, :]
+            batch_logits = model(
+                mx.concatenate([tok_a, tok_b], axis=0), cache=batch_cache
+            )[:, -1, :]
+            self.assertTrue(
+                mx.allclose(seq_a_logits[0], batch_logits[0], atol=1e-4).item(),
+                msg=f"batched seq A diverged from sequential at step {step}",
+            )
+            self.assertTrue(
+                mx.allclose(seq_b_logits[0], batch_logits[1], atol=1e-4).item(),
+                msg=f"batched seq B diverged from sequential at step {step}",
+            )
+            tok_a = mx.argmax(seq_a_logits, axis=-1)[:, None].astype(mx.int32)
+            tok_b = mx.argmax(seq_b_logits, axis=-1)[:, None].astype(mx.int32)
+
+    def test_gemma3n_kv_shared_prefill_chunking_invariant(self):
+        # KV-shared layers reuse a concrete layer's already-advanced cache, so
+        # all-at-once and token-by-token prefill must agree (RoPE is absolute).
+        model = self._tiny_gemma3n_model()
+        prompt = mx.array([[7, 3, 11, 0, 5, 9, 2, 8, 1, 6, 4]], dtype=mx.int32)
+
+        cache_all = model.make_cache()
+        logits_all = model(prompt, cache=cache_all)[:, -1, :]
+        cache_tok = model.make_cache()
+        for i in range(prompt.shape[1]):
+            logits_tok = model(prompt[:, i : i + 1], cache=cache_tok)[:, -1, :]
+        self.assertTrue(
+            mx.allclose(logits_all, logits_tok, atol=1e-4).item(),
+            msg="KV-shared prefill is chunking-dependent (queries RoPE'd at the "
+            "wrong offset)",
+        )
+
     def test_all_models(self):
         test_configs = [
             {
